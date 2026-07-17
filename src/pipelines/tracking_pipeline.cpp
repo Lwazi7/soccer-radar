@@ -4,6 +4,7 @@
 #include <iostream>
 #include <random>
 #include <algorithm>
+#include <chrono>
 
 namespace soccer_radar {
 
@@ -44,13 +45,11 @@ void TrackingPipeline::train_team_assignment(const std::string& video_path, int 
     int sampled_count = 0;
     int total_video_frames = reader.total_frames();
 
-    // Cap training sample count cleanly according to user requested max_frames
     int upper_frame_limit = (max_frames > 0) ? max_frames : TRAINING_FRAME_LIMIT;
     if (total_video_frames > 0 && upper_frame_limit > total_video_frames) {
         upper_frame_limit = total_video_frames;
     }
 
-    // Adaptive crop target: for fast mobile execution, 80-120 crops are sufficient for 2-team clustering
     const int TARGET_CROPS = (max_frames > 0 && max_frames <= 60) ? 60 : 120;
     const int stride = (max_frames > 0 && max_frames <= 30) ? 2 : TRAINING_FRAME_STRIDE;
 
@@ -94,7 +93,6 @@ void TrackingPipeline::train_team_assignment(const std::string& video_path, int 
     std::vector<std::vector<float>> all_embeddings;
     all_embeddings.reserve(all_crops.size());
 
-    // Batched extraction during training (24 crops simultaneously per ONNX call)
     const size_t batch_size = 24;
     for (size_t i = 0; i < all_crops.size(); i += batch_size) {
         size_t end = std::min(i + batch_size, all_crops.size());
@@ -112,18 +110,64 @@ void TrackingPipeline::train_team_assignment(const std::string& video_path, int 
 void TrackingPipeline::process_frame(const cv::Mat& frame,
                                       Detections& players,
                                       Detections& balls,
-                                      Detections& referees) {
-    detection_pipeline_.detect_frame(frame, players, balls, referees);
+                                      Detections& referees,
+                                      TrackingTiming* timing) {
+    if (timing) {
+        *timing = TrackingTiming{};
+    }
 
-    players = tracker_.update(players);
+    if (frame_idx_global_ % DETECTION_STRIDE == 0) {
+        DetectionTiming dt;
+        detection_pipeline_.detect_frame(frame, players, balls, referees, &dt);
+        if (timing) {
+            timing->det_preprocess_ms  = dt.preprocess_ms;
+            timing->det_onnx_run_ms    = dt.onnx_run_ms;
+            timing->det_postprocess_ms = dt.postprocess_ms;
+            timing->ran_yolo = true;
+        }
 
+        // Suppress false-positive balls on close-up jerseys during replays or close shots
+        bool is_closeup = false;
+        for (const auto& b : players.boxes) {
+            if (b.height() > 220.0f) { is_closeup = true; break; }
+        }
+        if (is_closeup) {
+            Detections clean_balls;
+            for (const auto& b : balls.boxes) {
+                if (b.confidence >= 0.35f) clean_balls.add(b);
+            }
+            balls = std::move(clean_balls);
+        }
+
+        last_balls_ = balls;
+        last_referees_ = referees;
+
+        auto t_track0 = std::chrono::steady_clock::now();
+        players = tracker_.update(players, false);
+        auto t_track1 = std::chrono::steady_clock::now();
+        if (timing) {
+            timing->tracker_update_ms = std::chrono::duration<double, std::milli>(t_track1 - t_track0).count();
+        }
+    } else {
+        auto t_track0 = std::chrono::steady_clock::now();
+        players = tracker_.update(Detections{}, true);
+        auto t_track1 = std::chrono::steady_clock::now();
+        if (timing) {
+            timing->tracker_update_ms = std::chrono::duration<double, std::milli>(t_track1 - t_track0).count();
+            timing->ran_yolo = false;
+        }
+        balls = last_balls_;
+        referees = last_referees_;
+    }
+
+    auto t_clus0 = std::chrono::steady_clock::now();
     if (!players.empty() && clustering_.is_trained()) {
         std::vector<int> needs_embedding;
         needs_embedding.reserve(players.size());
 
         for (int i = 0; i < players.size(); ++i) {
             int tid = players.boxes[i].track_id;
-            if (tid < 0) continue;
+            if (tid < 0 || players.boxes[i].class_id == 2) continue; // Skip referees
 
             auto cache_it = team_cache_.find(tid);
             if (cache_it != team_cache_.end()) {
@@ -158,15 +202,19 @@ void TrackingPipeline::process_frame(const cv::Mat& frame,
                     int tid = players.boxes[player_idx].track_id;
                     int team = team_labels[j];
 
-                    players.boxes[player_idx].class_id = team;
+                    tracker_.update_team_votes(tid, team);
                     team_cache_[tid] = team;
+                    players.boxes[player_idx].class_id = team;
                     last_validation_frame_[tid] = frame_idx_global_;
                 }
 
-                // Propagate updated team cache directly back into ByteTracker tracks
                 tracker_.update_team_labels(team_cache_);
             }
         }
+    }
+    auto t_clus1 = std::chrono::steady_clock::now();
+    if (timing) {
+        timing->clustering_ms = std::chrono::duration<double, std::milli>(t_clus1 - t_clus0).count();
     }
 
     frame_idx_global_++;
@@ -176,41 +224,45 @@ void TrackingPipeline::store_tracks(const Detections& players,
                                      const Detections& balls,
                                      const Detections& referees,
                                      int frame_idx,
-                                     std::unordered_map<int, BBox>& player_tracks,
-                                     std::unordered_map<int, int>& player_teams,
-                                     std::unordered_map<int, BBox>& ball_tracks,
-                                     std::unordered_map<int, BBox>& referee_tracks) {
+                                     std::unordered_map<int, BBox>& player_tracks_for_frame,
+                                     std::unordered_map<int, int>& player_teams_for_frame,
+                                     std::unordered_map<int, BBox>& ball_tracks_map,
+                                     std::unordered_map<int, BBox>& referee_tracks_for_frame) {
+    player_tracks_for_frame.clear();
+    player_teams_for_frame.clear();
+    referee_tracks_for_frame.clear();
+
     for (const auto& box : players.boxes) {
         if (box.track_id >= 0) {
-            player_tracks[box.track_id] = box;
-            player_teams[box.track_id] = box.class_id;
+            player_tracks_for_frame[box.track_id] = box;
+            player_teams_for_frame[box.track_id] = box.class_id;
         }
     }
 
     if (!balls.empty()) {
-        ball_tracks[frame_idx] = balls.boxes[0];
+        ball_tracks_map[frame_idx] = balls.boxes[0];
     }
 
     int ref_id = 0;
     for (const auto& box : referees.boxes) {
-        referee_tracks[ref_id++] = box;
+        referee_tracks_for_frame[ref_id++] = box;
     }
 }
 
 void TrackingPipeline::annotate_frame(cv::Mat& frame,
-                                       const std::unordered_map<int, BBox>& player_tracks,
-                                       const std::unordered_map<int, int>& player_teams,
-                                       const BBox& ball_track,
-                                       const std::unordered_map<int, BBox>& referee_tracks) {
+                                       const std::unordered_map<int, BBox>& player_tracks_for_frame,
+                                       const std::unordered_map<int, int>& player_teams_for_frame,
+                                       const BBox& ball_track_for_frame,
+                                       const std::unordered_map<int, BBox>& referee_tracks_for_frame) {
     FrameTracks ft;
-    for (const auto& [tid, bbox] : player_tracks) {
+    for (const auto& [tid, bbox] : player_tracks_for_frame) {
         ft.players.emplace_back(tid, bbox);
     }
-    for (const auto& [tid, team] : player_teams) {
+    for (const auto& [tid, team] : player_teams_for_frame) {
         ft.player_teams.emplace_back(tid, team);
     }
-    ft.ball = ball_track;
-    for (const auto& [rid, bbox] : referee_tracks) {
+    ft.ball = ball_track_for_frame;
+    for (const auto& [rid, bbox] : referee_tracks_for_frame) {
         ft.referees.emplace_back(rid, bbox);
     }
 

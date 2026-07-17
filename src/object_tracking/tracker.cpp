@@ -25,6 +25,9 @@ void ByteTracker::kalman_init(TrackState& track, const BBox& bbox) {
     track.state[6] = 0.0f;
     track.state[7] = 0.0f;
 
+    if (bbox.class_id == 2) track.referee_vote_count = 1;
+    else track.player_vote_count = 1;
+
     std::fill(track.covariance.begin(), track.covariance.end(), 0.0f);
     for (int i = 0; i < 8; ++i) {
         track.covariance[i * 8 + i] = 10.0f;
@@ -126,7 +129,22 @@ void ByteTracker::update_team_labels(const std::unordered_map<int, int>& team_ca
     }
 }
 
-Detections ByteTracker::update(const Detections& detections) {
+void ByteTracker::update_team_votes(int track_id, int predicted_team) {
+    auto update_fn = [track_id, predicted_team](TrackState& t) {
+        if (t.track_id == track_id) {
+            if (predicted_team == 0) t.team0_vote_count++;
+            else if (predicted_team == 1) t.team1_vote_count++;
+            if (t.team0_vote_count >= t.team1_vote_count) t.team_label = 0;
+            else t.team_label = 1;
+            return true;
+        }
+        return false;
+    };
+    for (auto& t : active_tracks_) if (update_fn(t)) break;
+    for (auto& t : lost_tracks_) if (update_fn(t)) break;
+}
+
+Detections ByteTracker::update(const Detections& detections, bool is_predicted_frame) {
     for (auto& track : active_tracks_) {
         kalman_predict(track);
         track.bbox.x1 = track.state[0] - track.state[2] * 0.5f;
@@ -142,14 +160,27 @@ Detections ByteTracker::update(const Detections& detections) {
         track.bbox.y2 = track.state[1] + track.state[3] * 0.5f;
     }
 
-    constexpr float HIGH_CONF_THRESH = 0.40f;
-    constexpr float LOW_CONF_THRESH  = 0.15f;
+    if (is_predicted_frame) {
+        Detections pred_result;
+        for (auto& track : active_tracks_) {
+            track.frames_since_seen++;
+            BBox out = track.bbox;
+            out.track_id = track.track_id;
+            if (track.referee_vote_count > track.player_vote_count) {
+                out.class_id = 2;
+            } else {
+                out.class_id = (track.team_label != -1) ? track.team_label : 0;
+            }
+            pred_result.add(out);
+        }
+        return pred_result;
+    }
 
     std::vector<BBox> det_high, det_low;
     for (const auto& b : detections.boxes) {
-        if (b.confidence >= HIGH_CONF_THRESH) {
+        if (b.confidence >= TRACKER_HIGH_CONF_THRESH) {
             det_high.push_back(b);
-        } else if (b.confidence >= LOW_CONF_THRESH) {
+        } else if (b.confidence >= TRACKER_LOW_CONF_THRESH) {
             det_low.push_back(b);
         }
     }
@@ -172,9 +203,16 @@ Detections ByteTracker::update(const Detections& detections) {
         track_pool[track_idx].frames_since_seen = 0;
         track_pool[track_idx].total_hits++;
 
+        if (det_high[det_idx].class_id == 2) track_pool[track_idx].referee_vote_count++;
+        else track_pool[track_idx].player_vote_count++;
+
         BBox out = det_high[det_idx];
         out.track_id = track_pool[track_idx].track_id;
-        out.class_id = (track_pool[track_idx].team_label != -1) ? track_pool[track_idx].team_label : out.class_id;
+        if (track_pool[track_idx].referee_vote_count > track_pool[track_idx].player_vote_count) {
+            out.class_id = 2;
+        } else {
+            out.class_id = (track_pool[track_idx].team_label != -1) ? track_pool[track_idx].team_label : 0;
+        }
         result.add(out);
 
         next_active.push_back(track_pool[track_idx]);
@@ -198,9 +236,16 @@ Detections ByteTracker::update(const Detections& detections) {
         remain_active[track_idx].frames_since_seen = 0;
         remain_active[track_idx].total_hits++;
 
+        if (det_low[det_idx].class_id == 2) remain_active[track_idx].referee_vote_count++;
+        else remain_active[track_idx].player_vote_count++;
+
         BBox out = det_low[det_idx];
         out.track_id = remain_active[track_idx].track_id;
-        out.class_id = (remain_active[track_idx].team_label != -1) ? remain_active[track_idx].team_label : out.class_id;
+        if (remain_active[track_idx].referee_vote_count > remain_active[track_idx].player_vote_count) {
+            out.class_id = 2;
+        } else {
+            out.class_id = (remain_active[track_idx].team_label != -1) ? remain_active[track_idx].team_label : 0;
+        }
         result.add(out);
 
         next_active.push_back(remain_active[track_idx]);
@@ -237,6 +282,11 @@ Detections ByteTracker::update(const Detections& detections) {
 
             BBox out = det_high[i];
             out.track_id = new_track.track_id;
+            if (new_track.referee_vote_count > new_track.player_vote_count) {
+                out.class_id = 2;
+            } else {
+                out.class_id = 0;
+            }
             result.add(out);
         }
     }

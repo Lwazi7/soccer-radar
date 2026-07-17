@@ -12,8 +12,9 @@ bool DetectionPipeline::initialize(const std::string& model_path) {
 void DetectionPipeline::detect_frame(const cv::Mat& frame,
                                       Detections& players,
                                       Detections& balls,
-                                      Detections& referees) {
-    detector_.detect(frame, players, balls, referees);
+                                      Detections& referees,
+                                      DetectionTiming* timing) {
+    detector_.detect(frame, players, balls, referees, timing);
 }
 
 } // namespace soccer_radar

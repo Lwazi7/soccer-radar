@@ -4,13 +4,10 @@
 #include <opencv2/core.hpp>
 #include <string>
 #include <vector>
+#include <onnxruntime_cxx_api.h>
 
 namespace soccer_radar {
 
-// MobileNetV4 Conv Small embedding extractor.
-// Extracts feature embeddings from player crop images using ONNX Runtime.
-// Replaces the original SigLIP embeddings with a much lighter model
-// suitable for constrained devices.
 class EmbeddingExtractor {
 public:
     EmbeddingExtractor();
@@ -22,15 +19,9 @@ public:
     bool load_model(const std::string& model_path);
     bool is_loaded() const { return session_ != nullptr; }
 
-    // Extract embedding from a single crop image
-    // Returns embedding vector of dimension EMBEDDING_DIM
     std::vector<float> extract(const cv::Mat& crop);
-
-    // Extract embeddings from multiple crops (batch processing)
-    // More efficient than calling extract() multiple times
     std::vector<std::vector<float>> extract_batch(const std::vector<cv::Mat>& crops);
 
-    // Get player crops from frame using detection bounding boxes
     static std::vector<cv::Mat> get_player_crops(const cv::Mat& frame,
                                                   const std::vector<BBox>& boxes);
 
@@ -45,9 +36,12 @@ private:
 
     int input_height_{224};
     int input_width_{224};
-    int embedding_dim_{1280}; // MobileNetV4 Conv Small output dimension
+    int embedding_dim_{1280};
+    ONNXTensorElementDataType input_elem_type_{ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT};
+    ONNXTensorElementDataType output_elem_type_{ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT};
 
     std::vector<float> input_blob_;
+    std::vector<Ort::Float16_t> input_blob_fp16_;
     std::vector<float> output_data_;
     std::string input_name_;
     std::vector<std::string> output_names_;

@@ -20,31 +20,29 @@ public:
     bool initialize(const std::string& model_path,
                     const std::string& embedding_model_path);
 
-    // Train team assignment models from video (bound by max_frames if set)
     void train_team_assignment(const std::string& video_path, int max_frames = -1);
 
-    // Process a single frame: detect -> track -> cluster (with caching)
     void process_frame(const cv::Mat& frame,
                        Detections& players,
                        Detections& balls,
-                       Detections& referees);
+                       Detections& referees,
+                       TrackingTiming* timing = nullptr);
 
-    // Convert detections to frame tracks for storage
+    // Stores active detections and teams specifically for the current frame_idx
     void store_tracks(const Detections& players,
                       const Detections& balls,
                       const Detections& referees,
                       int frame_idx,
-                      std::unordered_map<int, BBox>& player_tracks,
-                      std::unordered_map<int, int>& player_teams,
-                      std::unordered_map<int, BBox>& ball_tracks,
-                      std::unordered_map<int, BBox>& referee_tracks);
+                      std::unordered_map<int, BBox>& player_tracks_for_frame,
+                      std::unordered_map<int, int>& player_teams_for_frame,
+                      std::unordered_map<int, BBox>& ball_tracks_map,
+                      std::unordered_map<int, BBox>& referee_tracks_for_frame);
 
-    // Annotate a frame with stored tracks
     void annotate_frame(cv::Mat& frame,
-                        const std::unordered_map<int, BBox>& player_tracks,
-                        const std::unordered_map<int, int>& player_teams,
-                        const BBox& ball_track,
-                        const std::unordered_map<int, BBox>& referee_tracks);
+                        const std::unordered_map<int, BBox>& player_tracks_for_frame,
+                        const std::unordered_map<int, int>& player_teams_for_frame,
+                        const BBox& ball_track_for_frame,
+                        const std::unordered_map<int, BBox>& referee_tracks_for_frame);
 
 private:
     DetectionPipeline detection_pipeline_;
@@ -56,6 +54,9 @@ private:
     std::unordered_map<int, int> last_validation_frame_;
     static constexpr int REVALIDATE_INTERVAL = 60;
     int frame_idx_global_{0};
+
+    Detections last_balls_;
+    Detections last_referees_;
 };
 
 } // namespace soccer_radar

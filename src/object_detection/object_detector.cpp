@@ -9,6 +9,7 @@
 #include <iostream>
 #include <numeric>
 #include <cmath>
+#include <chrono>
 
 namespace soccer_radar {
 
@@ -50,6 +51,7 @@ bool ObjectDetector::load_model(const std::string& model_path) {
         auto input_type_info = session->GetInputTypeInfo(0);
         auto tensor_info = input_type_info.GetTensorTypeAndShapeInfo();
         input_shape_ = tensor_info.GetShape();
+        input_elem_type_ = tensor_info.GetElementType();
 
         for (auto& dim : input_shape_) {
             if (dim <= 0) dim = 1;
@@ -66,10 +68,19 @@ bool ObjectDetector::load_model(const std::string& model_path) {
             output_names_.push_back(name.get());
         }
 
+        if (num_outputs > 0) {
+            auto out_info = session->GetOutputTypeInfo(0);
+            output_elem_type_ = out_info.GetTensorTypeAndShapeInfo().GetElementType();
+        }
+
         input_blob_.resize(static_cast<size_t>(3 * input_height_ * input_width_));
+        if (input_elem_type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+            input_blob_fp16_.resize(input_blob_.size());
+        }
 
         std::cout << "[ObjectDetector] Model loaded: " << model_path
-                  << " (input: " << input_width_ << "x" << input_height_ << ")" << std::endl;
+                  << " (input: " << input_width_ << "x" << input_height_
+                  << ", format: " << (input_elem_type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 ? "FP16" : "FP32") << ")" << std::endl;
         return true;
 
     } catch (const Ort::Exception& e) {
@@ -119,14 +130,25 @@ void ObjectDetector::postprocess(const std::vector<float>& output,
         int max_class = 0;
 
         if (needs_transpose) {
-            for (int c = 0; c < NUM_CLASSES && (4 + c) < num_features; ++c) {
-                float score = output[(4 + c) * num_detections + i];
-                if (score > max_score) {
-                    max_score = score;
-                    max_class = c;
-                }
+            float s_player  = (4 < num_features) ? output[4 * num_detections + i] : 0.0f;
+            float s_ball    = (5 < num_features) ? output[5 * num_detections + i] : 0.0f;
+            float s_referee = (6 < num_features) ? output[6 * num_detections + i] : 0.0f;
+
+            if (s_player < PLAYER_CONFIDENCE_THRESHOLD &&
+                s_ball < CONFIDENCE_THRESHOLD &&
+                s_referee < REFEREE_CONFIDENCE_THRESHOLD) {
+                continue;
             }
-            if (max_score < CONFIDENCE_THRESHOLD) continue;
+
+            if (s_player >= s_ball && s_player >= s_referee && s_player >= PLAYER_CONFIDENCE_THRESHOLD) {
+                max_score = s_player; max_class = 0;
+            } else if (s_ball >= s_player && s_ball >= s_referee && s_ball >= CONFIDENCE_THRESHOLD) {
+                max_score = s_ball; max_class = 1;
+            } else if (s_referee >= s_player && s_referee >= s_ball && s_referee >= REFEREE_CONFIDENCE_THRESHOLD) {
+                max_score = s_referee; max_class = 2;
+            } else {
+                continue;
+            }
 
             float cx = output[0 * num_detections + i];
             float cy = output[1 * num_detections + i];
@@ -154,14 +176,25 @@ void ObjectDetector::postprocess(const std::vector<float>& output,
             }
         } else {
             const int base = i * num_features;
-            for (int c = 0; c < NUM_CLASSES && (4 + c) < num_features; ++c) {
-                float score = output[base + 4 + c];
-                if (score > max_score) {
-                    max_score = score;
-                    max_class = c;
-                }
+            float s_player  = (4 < num_features) ? output[base + 4] : 0.0f;
+            float s_ball    = (5 < num_features) ? output[base + 5] : 0.0f;
+            float s_referee = (6 < num_features) ? output[base + 6] : 0.0f;
+
+            if (s_player < PLAYER_CONFIDENCE_THRESHOLD &&
+                s_ball < CONFIDENCE_THRESHOLD &&
+                s_referee < REFEREE_CONFIDENCE_THRESHOLD) {
+                continue;
             }
-            if (max_score < CONFIDENCE_THRESHOLD) continue;
+
+            if (s_player >= s_ball && s_player >= s_referee && s_player >= PLAYER_CONFIDENCE_THRESHOLD) {
+                max_score = s_player; max_class = 0;
+            } else if (s_ball >= s_player && s_ball >= s_referee && s_ball >= CONFIDENCE_THRESHOLD) {
+                max_score = s_ball; max_class = 1;
+            } else if (s_referee >= s_player && s_referee >= s_ball && s_referee >= REFEREE_CONFIDENCE_THRESHOLD) {
+                max_score = s_referee; max_class = 2;
+            } else {
+                continue;
+            }
 
             float cx = output[base + 0];
             float cy = output[base + 1];
@@ -231,18 +264,35 @@ void ObjectDetector::apply_nms(Detections& dets) {
 void ObjectDetector::detect(const cv::Mat& frame,
                              Detections& players,
                              Detections& balls,
-                             Detections& referees) {
+                             Detections& referees,
+                             DetectionTiming* timing) {
     if (!session_) return;
 
     auto* sess = static_cast<Ort::Session*>(session_);
     auto* mi = static_cast<Ort::MemoryInfo*>(mem_info_);
 
+    auto t0 = std::chrono::steady_clock::now();
     preprocess(frame, input_blob_);
+    auto t1 = std::chrono::steady_clock::now();
 
     std::array<int64_t, 4> input_shape = {1, 3, input_height_, input_width_};
-    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
-        *mi, input_blob_.data(), input_blob_.size(),
-        input_shape.data(), input_shape.size());
+    Ort::Value input_tensor{nullptr};
+
+    if (input_elem_type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+        if (input_blob_fp16_.size() != input_blob_.size()) {
+            input_blob_fp16_.resize(input_blob_.size());
+        }
+        for (size_t i = 0; i < input_blob_.size(); ++i) {
+            input_blob_fp16_[i] = float_to_half(input_blob_[i]);
+        }
+        input_tensor = Ort::Value::CreateTensor<Ort::Float16_t>(
+            *mi, input_blob_fp16_.data(), input_blob_fp16_.size(),
+            input_shape.data(), input_shape.size());
+    } else {
+        input_tensor = Ort::Value::CreateTensor<float>(
+            *mi, input_blob_.data(), input_blob_.size(),
+            input_shape.data(), input_shape.size());
+    }
 
     const char* input_names[] = { input_name_.c_str() };
     std::vector<const char*> out_names;
@@ -253,15 +303,25 @@ void ObjectDetector::detect(const cv::Mat& frame,
         input_names, &input_tensor, 1,
         out_names.data(), out_names.size());
 
+    auto t2 = std::chrono::steady_clock::now();
+
     auto& output_tensor = output_tensors[0];
     auto output_info = output_tensor.GetTensorTypeAndShapeInfo();
     auto output_shape = output_info.GetShape();
-    float* output_ptr = output_tensor.GetTensorMutableData<float>();
 
     int total_elements = 1;
     for (auto d : output_shape) total_elements *= static_cast<int>(d);
 
-    output_data_.assign(output_ptr, output_ptr + total_elements);
+    output_data_.resize(total_elements);
+    if (output_elem_type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+        Ort::Float16_t* out_fp16 = output_tensor.GetTensorMutableData<Ort::Float16_t>();
+        for (int i = 0; i < total_elements; ++i) {
+            output_data_[i] = half_to_float(out_fp16[i]);
+        }
+    } else {
+        float* output_ptr = output_tensor.GetTensorMutableData<float>();
+        std::copy(output_ptr, output_ptr + total_elements, output_data_.begin());
+    }
 
     int rows, cols;
     if (output_shape.size() == 3) {
@@ -276,15 +336,22 @@ void ObjectDetector::detect(const cv::Mat& frame,
 
     Detections all_dets;
     postprocess(output_data_, rows, cols, all_dets);
+    auto t3 = std::chrono::steady_clock::now();
+
+    if (timing) {
+        timing->preprocess_ms  = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        timing->onnx_run_ms    = std::chrono::duration<double, std::milli>(t2 - t1).count();
+        timing->postprocess_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
+    }
 
     players = all_dets.filter(static_cast<int>(ObjectClass::Player));
     balls = all_dets.filter(static_cast<int>(ObjectClass::Ball));
     referees = all_dets.filter(static_cast<int>(ObjectClass::Referee));
 }
 
-Detections ObjectDetector::detect_all(const cv::Mat& frame) {
+Detections ObjectDetector::detect_all(const cv::Mat& frame, DetectionTiming* timing) {
     Detections players, balls, referees;
-    detect(frame, players, balls, referees);
+    detect(frame, players, balls, referees, timing);
 
     Detections all;
     for (auto& b : players.boxes) all.add(b);

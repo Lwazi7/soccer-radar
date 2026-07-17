@@ -49,6 +49,7 @@ bool EmbeddingExtractor::load_model(const std::string& model_path) {
         auto input_type_info = session->GetInputTypeInfo(0);
         auto tensor_info = input_type_info.GetTensorTypeAndShapeInfo();
         auto shape = tensor_info.GetShape();
+        input_elem_type_ = tensor_info.GetElementType();
 
         if (shape.size() >= 4) {
             if (shape[2] > 0) input_height_ = static_cast<int>(shape[2]);
@@ -62,23 +63,28 @@ bool EmbeddingExtractor::load_model(const std::string& model_path) {
             output_names_.push_back(name.get());
         }
 
-        auto output_type_info = session->GetOutputTypeInfo(0);
-        auto output_tensor_info = output_type_info.GetTensorTypeAndShapeInfo();
-        auto output_shape = output_tensor_info.GetShape();
-
-        embedding_dim_ = 1280;
-        for (auto d : output_shape) {
-            if (d > 1 && d < 10000) {
-                embedding_dim_ = static_cast<int>(d);
-                break;
+        if (num_outputs > 0) {
+            auto out_info = session->GetOutputTypeInfo(0);
+            output_elem_type_ = out_info.GetTensorTypeAndShapeInfo().GetElementType();
+            auto output_shape = out_info.GetTensorTypeAndShapeInfo().GetShape();
+            embedding_dim_ = 1280;
+            for (auto d : output_shape) {
+                if (d > 1 && d < 10000) {
+                    embedding_dim_ = static_cast<int>(d);
+                    break;
+                }
             }
         }
 
         input_blob_.resize(static_cast<size_t>(3 * input_height_ * input_width_));
+        if (input_elem_type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+            input_blob_fp16_.resize(input_blob_.size());
+        }
 
         std::cout << "[EmbeddingExtractor] Model loaded: " << model_path
                   << " (input: " << input_width_ << "x" << input_height_
-                  << ", embedding_dim: " << embedding_dim_ << ")" << std::endl;
+                  << ", embedding_dim: " << embedding_dim_
+                  << ", format: " << (input_elem_type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 ? "FP16" : "FP32") << ")" << std::endl;
         return true;
 
     } catch (const Ort::Exception& e) {
@@ -108,9 +114,9 @@ void EmbeddingExtractor::preprocess(const cv::Mat& image, std::vector<float>& bl
             const int src_idx = col * 3;
             const int dst_idx = row_offset + col;
 
-            float r = static_cast<float>(src_row[src_idx + 2]) / 255.0f;
-            float g = static_cast<float>(src_row[src_idx + 1]) / 255.0f;
-            float b = static_cast<float>(src_row[src_idx + 0]) / 255.0f;
+            float r = static_cast<float>(src_row[src_idx + 2]) * (1.0f / 255.0f);
+            float g = static_cast<float>(src_row[src_idx + 1]) * (1.0f / 255.0f);
+            float b = static_cast<float>(src_row[src_idx + 0]) * (1.0f / 255.0f);
 
             ch_r[dst_idx] = (r - mean_r) / std_r;
             ch_g[dst_idx] = (g - mean_g) / std_g;
@@ -128,9 +134,23 @@ std::vector<float> EmbeddingExtractor::extract(const cv::Mat& crop) {
     preprocess(crop, input_blob_);
 
     std::array<int64_t, 4> input_shape = {1, 3, input_height_, input_width_};
-    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
-        *mi, input_blob_.data(), input_blob_.size(),
-        input_shape.data(), input_shape.size());
+    Ort::Value input_tensor{nullptr};
+
+    if (input_elem_type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+        if (input_blob_fp16_.size() != input_blob_.size()) {
+            input_blob_fp16_.resize(input_blob_.size());
+        }
+        for (size_t i = 0; i < input_blob_.size(); ++i) {
+            input_blob_fp16_[i] = float_to_half(input_blob_[i]);
+        }
+        input_tensor = Ort::Value::CreateTensor<Ort::Float16_t>(
+            *mi, input_blob_fp16_.data(), input_blob_fp16_.size(),
+            input_shape.data(), input_shape.size());
+    } else {
+        input_tensor = Ort::Value::CreateTensor<float>(
+            *mi, input_blob_.data(), input_blob_.size(),
+            input_shape.data(), input_shape.size());
+    }
 
     const char* input_names[] = { input_name_.c_str() };
     std::vector<const char*> out_names;
@@ -142,24 +162,33 @@ std::vector<float> EmbeddingExtractor::extract(const cv::Mat& crop) {
         out_names.data(), out_names.size());
 
     auto& output_tensor = output_tensors[0];
-    float* output_ptr = output_tensor.GetTensorMutableData<float>();
-
     auto output_info = output_tensor.GetTensorTypeAndShapeInfo();
     auto output_shape = output_info.GetShape();
 
     int total_elements = 1;
     for (auto d : output_shape) total_elements *= static_cast<int>(d);
 
+    output_data_.resize(total_elements);
+    if (output_elem_type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+        Ort::Float16_t* out_fp16 = output_tensor.GetTensorMutableData<Ort::Float16_t>();
+        for (int i = 0; i < total_elements; ++i) {
+            output_data_[i] = half_to_float(out_fp16[i]);
+        }
+    } else {
+        float* output_ptr = output_tensor.GetTensorMutableData<float>();
+        std::copy(output_ptr, output_ptr + total_elements, output_data_.begin());
+    }
+
     std::vector<float> embedding(embedding_dim_, 0);
 
     if (total_elements == embedding_dim_) {
-        std::copy(output_ptr, output_ptr + embedding_dim_, embedding.begin());
+        std::copy(output_data_.begin(), output_data_.begin() + embedding_dim_, embedding.begin());
     } else if (total_elements > embedding_dim_) {
         int spatial_size = total_elements / embedding_dim_;
         for (int c = 0; c < embedding_dim_; ++c) {
             float sum = 0;
             for (int s = 0; s < spatial_size; ++s) {
-                sum += output_ptr[c * spatial_size + s];
+                sum += output_data_[c * spatial_size + s];
             }
             embedding[c] = sum / static_cast<float>(spatial_size);
         }
@@ -203,9 +232,9 @@ std::vector<std::vector<float>> EmbeddingExtractor::extract_batch(
             for (int c = 0; c < input_width_; ++c) {
                 const int src_idx = c * 3;
                 const int dst_idx = row_offset + c;
-                ch_r[dst_idx] = (static_cast<float>(row_ptr[src_idx + 2]) / 255.0f - mean_r) / std_r;
-                ch_g[dst_idx] = (static_cast<float>(row_ptr[src_idx + 1]) / 255.0f - mean_g) / std_g;
-                ch_b[dst_idx] = (static_cast<float>(row_ptr[src_idx + 0]) / 255.0f - mean_b) / std_b;
+                ch_r[dst_idx] = (static_cast<float>(row_ptr[src_idx + 2]) * (1.0f / 255.0f) - mean_r) / std_r;
+                ch_g[dst_idx] = (static_cast<float>(row_ptr[src_idx + 1]) * (1.0f / 255.0f) - mean_g) / std_g;
+                ch_b[dst_idx] = (static_cast<float>(row_ptr[src_idx + 0]) * (1.0f / 255.0f) - mean_b) / std_b;
             }
         }
     }
@@ -214,9 +243,21 @@ std::vector<std::vector<float>> EmbeddingExtractor::extract_batch(
     auto* mi = static_cast<Ort::MemoryInfo*>(mem_info_);
 
     std::array<int64_t, 4> input_shape = { static_cast<int64_t>(batch_size), 3, input_height_, input_width_ };
-    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
-        *mi, batched_blob.data(), batched_blob.size(),
-        input_shape.data(), input_shape.size());
+    Ort::Value input_tensor{nullptr};
+
+    if (input_elem_type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+        std::vector<Ort::Float16_t> batched_fp16(batched_blob.size());
+        for (size_t i = 0; i < batched_blob.size(); ++i) {
+            batched_fp16[i] = float_to_half(batched_blob[i]);
+        }
+        input_tensor = Ort::Value::CreateTensor<Ort::Float16_t>(
+            *mi, batched_fp16.data(), batched_fp16.size(),
+            input_shape.data(), input_shape.size());
+    } else {
+        input_tensor = Ort::Value::CreateTensor<float>(
+            *mi, batched_blob.data(), batched_blob.size(),
+            input_shape.data(), input_shape.size());
+    }
 
     const char* input_names[] = { input_name_.c_str() };
     std::vector<const char*> out_names;
@@ -225,16 +266,26 @@ std::vector<std::vector<float>> EmbeddingExtractor::extract_batch(
     auto output_tensors = sess->Run(Ort::RunOptions{nullptr}, input_names, &input_tensor, 1,
                                     out_names.data(), out_names.size());
 
-    float* out_ptr = output_tensors[0].GetTensorMutableData<float>();
-    auto shape = output_tensors[0].GetTensorTypeAndShapeInfo().GetShape();
-    
+    auto& output_tensor = output_tensors[0];
+    auto shape = output_tensor.GetTensorTypeAndShapeInfo().GetShape();
     size_t elements_per_sample = 1;
     for (size_t i = 1; i < shape.size(); ++i) elements_per_sample *= static_cast<size_t>(shape[i]);
+
+    std::vector<float> batched_out_float(batch_size * elements_per_sample);
+    if (output_elem_type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+        Ort::Float16_t* out_fp16 = output_tensor.GetTensorMutableData<Ort::Float16_t>();
+        for (size_t i = 0; i < batched_out_float.size(); ++i) {
+            batched_out_float[i] = half_to_float(out_fp16[i]);
+        }
+    } else {
+        float* out_ptr = output_tensor.GetTensorMutableData<float>();
+        std::copy(out_ptr, out_ptr + batched_out_float.size(), batched_out_float.begin());
+    }
 
     std::vector<std::vector<float>> results(batch_size, std::vector<float>(embedding_dim_, 0.0f));
 
     for (size_t b = 0; b < batch_size; ++b) {
-        float* sample_ptr = out_ptr + b * elements_per_sample;
+        float* sample_ptr = batched_out_float.data() + b * elements_per_sample;
         auto& emb = results[b];
 
         if (elements_per_sample == static_cast<size_t>(embedding_dim_)) {

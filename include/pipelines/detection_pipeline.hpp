@@ -7,7 +7,6 @@
 
 namespace soccer_radar {
 
-// Coordinates object detection workflows.
 class DetectionPipeline {
 public:
     DetectionPipeline();
@@ -15,11 +14,11 @@ public:
 
     bool initialize(const std::string& model_path);
 
-    // Detect players, ball, referees in a single frame
     void detect_frame(const cv::Mat& frame,
                       Detections& players,
                       Detections& balls,
-                      Detections& referees);
+                      Detections& referees,
+                      DetectionTiming* timing = nullptr);
 
     ObjectDetector& detector() { return detector_; }
 

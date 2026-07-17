@@ -7,19 +7,15 @@
 
 namespace soccer_radar {
 
-// True three-stage ByteTrack implementation optimized for constrained devices.
 class ByteTracker {
 public:
-    ByteTracker(float match_thresh = 0.35f,
+    ByteTracker(float match_thresh = TRACKER_MATCH_THRESH,
                 int buffer_size = TRACKER_BUFFER_SIZE);
     ~ByteTracker() = default;
 
-    // Update tracker with new detections; returns detections with track_ids assigned
-    Detections update(const Detections& detections);
-
-    // Update internal active/lost tracks with team labels from clustering cache
+    Detections update(const Detections& detections, bool is_predicted_frame = false);
     void update_team_labels(const std::unordered_map<int, int>& team_cache);
-
+    void update_team_votes(int track_id, int predicted_team);
     void reset();
 
 private:

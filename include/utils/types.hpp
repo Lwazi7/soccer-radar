@@ -46,7 +46,7 @@ struct Detections {
         return out;
     }
 
-    // Get center points
+    // Get center points (cx, cy)
     std::vector<std::array<float,2>> centers() const {
         std::vector<std::array<float,2>> pts;
         pts.reserve(boxes.size());
@@ -55,23 +55,56 @@ struct Detections {
         }
         return pts;
     }
+
+    // Get bottom-center points (cx, y2) representing the feet on the grass plane (Z=0).
+    // Essential for accurate homography projection without head/torso height warping.
+    std::vector<std::array<float,2>> bottom_centers() const {
+        std::vector<std::array<float,2>> pts;
+        pts.reserve(boxes.size());
+        for (auto& b : boxes) {
+            pts.push_back({b.cx(), b.y2});
+        }
+        return pts;
+    }
 };
 
 // ============================================================================
-// Keypoint Data (per detection)
+// Timing Diagnostics
 // ============================================================================
+struct DetectionTiming {
+    double preprocess_ms{0.0};
+    double onnx_run_ms{0.0};
+    double postprocess_ms{0.0};
+};
+
+struct TrackingTiming {
+    double det_preprocess_ms{0.0};
+    double det_onnx_run_ms{0.0};
+    double det_postprocess_ms{0.0};
+    double tracker_update_ms{0.0};
+    double clustering_ms{0.0};
+    bool   ran_yolo{false};
+};
+
+// ============================================================================
+// Corner / Line Intersection Data (Football-TV2Radar representation)
+// ============================================================================
+struct FieldCorner {
+    float x{0}, y{0};      // Center coordinate of detected corner bounding box
+    float confidence{0};   // Detection confidence
+    int   class_id{0};     // Corner class index (0..12)
+};
+
 struct KeypointData {
-    // Shape: [num_detections][NUM_KEYPOINTS][3] stored flat
-    // But typically 1 detection per frame for field keypoints
-    std::vector<std::array<float, 3>> points; // x, y, confidence
+    std::vector<FieldCorner> corners;
 
-    int num_keypoints() const { return static_cast<int>(points.size()); }
-    bool empty() const { return points.empty(); }
-    void clear() { points.clear(); }
+    int num_corners() const { return static_cast<int>(corners.size()); }
+    bool empty() const { return corners.empty(); }
+    void clear() { corners.clear(); }
 };
 
 // ============================================================================
-// Track State for ByteTrack
+// Track State for ByteTrack (With Temporal Majority Voting Identity Lock)
 // ============================================================================
 struct TrackState {
     int    track_id{-1};
@@ -80,22 +113,24 @@ struct TrackState {
     int    total_hits{0};
     int    team_label{-1};
 
+    // Temporal voting history across all detections for this track
+    int    player_vote_count{0};
+    int    referee_vote_count{0};
+    int    team0_vote_count{0};
+    int    team1_vote_count{0};
+
     // Kalman state: [cx, cy, w, h, vx, vy, vw, vh]
     std::array<float, 8> state{};
-    std::array<float, 64> covariance{}; // 8x8 flattened
+    std::array<float, 64> covariance{};
 };
 
 // ============================================================================
 // Per-frame track storage
 // ============================================================================
 struct FrameTracks {
-    // player: track_id -> bbox
     std::vector<std::pair<int, BBox>> players;
-    // player: track_id -> team_label (class_id after clustering)
     std::vector<std::pair<int, int>>  player_teams;
-    // ball: single bbox (may be invalid)
     BBox ball;
-    // referees: id -> bbox
     std::vector<std::pair<int, BBox>> referees;
 };
 
@@ -109,6 +144,7 @@ struct TacticalMetadata {
     int  num_balls{0};
     int  num_referees{0};
     bool transform_valid{false};
+    bool is_replay{false};
 };
 
 } // namespace soccer_radar
