@@ -16,38 +16,23 @@ KeypointDetector::KeypointDetector() {
     input_blob_.resize(3 * MODEL_HEIGHT * MODEL_WIDTH);
 }
 
-KeypointDetector::~KeypointDetector() {
-    if (session_) {
-        delete static_cast<Ort::Session*>(session_);
-    }
-    if (env_) {
-        delete static_cast<Ort::Env*>(env_);
-    }
-    if (mem_info_) {
-        delete static_cast<Ort::MemoryInfo*>(mem_info_);
-    }
-}
-
 bool KeypointDetector::load_model(const std::string& model_path) {
     try {
-        auto* env = new Ort::Env(ORT_LOGGING_LEVEL_WARNING, "KeypointDetector");
-        env_ = env;
+        env_ = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "KeypointDetector");
 
         Ort::SessionOptions session_options;
         configure_session_options(session_options, 4);
 
-        auto* session = new Ort::Session(*env, model_path.c_str(), session_options);
-        session_ = session;
+        session_ = std::make_unique<Ort::Session>(*env_, model_path.c_str(), session_options);
 
-        auto* mem_info = new Ort::MemoryInfo(
+        mem_info_ = std::make_unique<Ort::MemoryInfo>(
             Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault));
-        mem_info_ = mem_info;
 
         Ort::AllocatorWithDefaultOptions allocator;
-        auto input_name = session->GetInputNameAllocated(0, allocator);
+        auto input_name = session_->GetInputNameAllocated(0, allocator);
         input_name_ = input_name.get();
 
-        auto input_type_info = session->GetInputTypeInfo(0);
+        auto input_type_info = session_->GetInputTypeInfo(0);
         auto tensor_info = input_type_info.GetTensorTypeAndShapeInfo();
         input_shape_ = tensor_info.GetShape();
         input_elem_type_ = tensor_info.GetElementType();
@@ -60,15 +45,15 @@ bool KeypointDetector::load_model(const std::string& model_path) {
             input_width_ = static_cast<int>(input_shape_[3]);
         }
 
-        size_t num_outputs = session->GetOutputCount();
+        size_t num_outputs = session_->GetOutputCount();
         output_names_.clear();
         for (size_t i = 0; i < num_outputs; ++i) {
-            auto name = session->GetOutputNameAllocated(i, allocator);
+            auto name = session_->GetOutputNameAllocated(i, allocator);
             output_names_.push_back(name.get());
         }
 
         if (num_outputs > 0) {
-            auto out_info = session->GetOutputTypeInfo(0);
+            auto out_info = session_->GetOutputTypeInfo(0);
             output_elem_type_ = out_info.GetTensorTypeAndShapeInfo().GetElementType();
         }
 
@@ -212,9 +197,6 @@ KeypointData KeypointDetector::detect(const cv::Mat& frame) {
     KeypointData result;
     if (!session_) return result;
 
-    auto* sess = static_cast<Ort::Session*>(session_);
-    auto* mi = static_cast<Ort::MemoryInfo*>(mem_info_);
-
     preprocess(frame, input_blob_);
 
     std::array<int64_t, 4> input_shape = {1, 3, input_height_, input_width_};
@@ -228,11 +210,11 @@ KeypointData KeypointDetector::detect(const cv::Mat& frame) {
             input_blob_fp16_[i] = float_to_half(input_blob_[i]);
         }
         input_tensor = Ort::Value::CreateTensor<Ort::Float16_t>(
-            *mi, input_blob_fp16_.data(), input_blob_fp16_.size(),
+            *mem_info_, input_blob_fp16_.data(), input_blob_fp16_.size(),
             input_shape.data(), input_shape.size());
     } else {
         input_tensor = Ort::Value::CreateTensor<float>(
-            *mi, input_blob_.data(), input_blob_.size(),
+            *mem_info_, input_blob_.data(), input_blob_.size(),
             input_shape.data(), input_shape.size());
     }
 
@@ -240,7 +222,7 @@ KeypointData KeypointDetector::detect(const cv::Mat& frame) {
     std::vector<const char*> out_names;
     for (auto& n : output_names_) out_names.push_back(n.c_str());
 
-    auto output_tensors = sess->Run(
+    auto output_tensors = session_->Run(
         Ort::RunOptions{nullptr},
         input_names, &input_tensor, 1,
         out_names.data(), out_names.size());

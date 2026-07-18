@@ -25,10 +25,15 @@ private:
 
     static float compute_iou(const BBox& a, const BBox& b);
 
+    // Hungarian Algorithm (optimal bipartite assignment) across IoU cost matrices
     std::vector<std::pair<int,int>> match_tracks_to_detections(
         const std::vector<TrackState>& tracks,
         const std::vector<BBox>& detections,
         float thresh);
+
+    static std::vector<std::pair<int,int>> solve_hungarian(
+        const std::vector<std::vector<float>>& cost_matrix,
+        float max_cost);
 
     float match_thresh_;
     int   buffer_size_;

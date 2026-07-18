@@ -4,6 +4,7 @@
 #include <opencv2/core.hpp>
 #include <string>
 #include <vector>
+#include <memory>
 #include <onnxruntime_cxx_api.h>
 
 namespace soccer_radar {
@@ -11,10 +12,12 @@ namespace soccer_radar {
 class EmbeddingExtractor {
 public:
     EmbeddingExtractor();
-    ~EmbeddingExtractor();
+    ~EmbeddingExtractor() = default;
 
     EmbeddingExtractor(const EmbeddingExtractor&) = delete;
     EmbeddingExtractor& operator=(const EmbeddingExtractor&) = delete;
+    EmbeddingExtractor(EmbeddingExtractor&&) noexcept = default;
+    EmbeddingExtractor& operator=(EmbeddingExtractor&&) noexcept = default;
 
     bool load_model(const std::string& model_path);
     bool is_loaded() const { return session_ != nullptr; }
@@ -30,9 +33,9 @@ public:
 private:
     void preprocess(const cv::Mat& image, std::vector<float>& blob);
 
-    void* session_{nullptr};
-    void* env_{nullptr};
-    void* mem_info_{nullptr};
+    std::unique_ptr<Ort::Env> env_;
+    std::unique_ptr<Ort::MemoryInfo> mem_info_;
+    std::unique_ptr<Ort::Session> session_;
 
     int input_height_{224};
     int input_width_{224};

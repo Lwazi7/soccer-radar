@@ -4,6 +4,7 @@
 #include <opencv2/core.hpp>
 #include <string>
 #include <vector>
+#include <memory>
 #include <onnxruntime_cxx_api.h>
 
 namespace soccer_radar {
@@ -11,10 +12,12 @@ namespace soccer_radar {
 class KeypointDetector {
 public:
     KeypointDetector();
-    ~KeypointDetector();
+    ~KeypointDetector() = default;
 
     KeypointDetector(const KeypointDetector&) = delete;
     KeypointDetector& operator=(const KeypointDetector&) = delete;
+    KeypointDetector(KeypointDetector&&) noexcept = default;
+    KeypointDetector& operator=(KeypointDetector&&) noexcept = default;
 
     bool load_model(const std::string& model_path);
     bool is_loaded() const { return session_ != nullptr; }
@@ -29,9 +32,9 @@ private:
     void postprocess(const std::vector<float>& output, int output_rows, int output_cols, KeypointData& out);
     static void apply_nms(std::vector<FieldCorner>& corners);
 
-    void* session_{nullptr};
-    void* env_{nullptr};
-    void* mem_info_{nullptr};
+    std::unique_ptr<Ort::Env> env_;
+    std::unique_ptr<Ort::MemoryInfo> mem_info_;
+    std::unique_ptr<Ort::Session> session_;
 
     int input_height_{736};
     int input_width_{1280};

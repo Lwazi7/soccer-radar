@@ -16,8 +16,10 @@ endif()
 # Find OpenCV
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs videoio calib3d)
 
-# Locate ONNX Runtime seamlessly across Termux, environment variables, or standard Linux paths
-if(DEFINED ENV{ONNXRUNTIME_ROOT})
+# Locate ONNX Runtime seamlessly across Termux, command line (-DONNXRUNTIME_ROOT=...), environment variables, or Linux paths
+if(DEFINED ONNXRUNTIME_ROOT AND EXISTS "${ONNXRUNTIME_ROOT}")
+    # Retain user passed -DONNXRUNTIME_ROOT=...
+elseif(DEFINED ENV{ONNXRUNTIME_ROOT} AND EXISTS "$ENV{ONNXRUNTIME_ROOT}")
     set(ONNXRUNTIME_ROOT "$ENV{ONNXRUNTIME_ROOT}")
 elseif(EXISTS "/data/data/com.termux/files/usr/include/onnxruntime")
     set(ONNXRUNTIME_ROOT "/data/data/com.termux/files/usr")
@@ -31,7 +33,7 @@ endif()
 
 message(STATUS "Using ONNX Runtime root: ${ONNXRUNTIME_ROOT}")
 
-# Comprehensive list of all possible OpenCV header directories (Termux, Linux, macOS, CMake variables)
+# Comprehensive list of all possible OpenCV header directories
 set(ALL_OPENCV_INCLUDE_PATHS
     ${OpenCV_INCLUDE_DIRS}
     ${OPENCV_INCLUDE_DIRS}
@@ -67,7 +69,6 @@ add_executable(soccer_radar
     src/pipelines/tactical_pipeline.cpp
 )
 
-# Explicit target include directories guaranteeing `-I/data/data/com.termux/files/usr/include/opencv4` is passed to every file
 target_include_directories(soccer_radar PRIVATE
     ${CMAKE_SOURCE_DIR}/include
     ${ALL_OPENCV_INCLUDE_PATHS}
@@ -75,7 +76,6 @@ target_include_directories(soccer_radar PRIVATE
     ${ONNXRUNTIME_ROOT}/include/onnxruntime
 )
 
-# Link Libraries (Support both modern CMake target variables and explicit Termux shared objects)
 set(OPENCV_TERMUX_SO
     "/data/data/com.termux/files/usr/lib/libopencv_core.so"
     "/data/data/com.termux/files/usr/lib/libopencv_imgproc.so"
@@ -90,10 +90,15 @@ else()
     set(FINAL_OPENCV_LIBS ${OpenCV_LIBS} ${OpenCV_LIBRARIES})
 endif()
 
-if(EXISTS "${ONNXRUNTIME_ROOT}/lib/libonnxruntime.so")
-    target_link_libraries(soccer_radar PRIVATE ${FINAL_OPENCV_LIBS} "${ONNXRUNTIME_ROOT}/lib/libonnxruntime.so")
-elseif(EXISTS "${ONNXRUNTIME_ROOT}/lib/libonnxruntime.dylib")
-    target_link_libraries(soccer_radar PRIVATE ${FINAL_OPENCV_LIBS} "${ONNXRUNTIME_ROOT}/lib/libonnxruntime.dylib")
+file(GLOB ONNX_SO "${ONNXRUNTIME_ROOT}/lib/libonnxruntime.so*")
+file(GLOB ONNX_DYLIB "${ONNXRUNTIME_ROOT}/lib/libonnxruntime.dylib*")
+
+if(ONNX_SO)
+    list(GET ONNX_SO 0 FIRST_ONNX_SO)
+    target_link_libraries(soccer_radar PRIVATE ${FINAL_OPENCV_LIBS} "${FIRST_ONNX_SO}")
+elseif(ONNX_DYLIB)
+    list(GET ONNX_DYLIB 0 FIRST_ONNX_DYLIB)
+    target_link_libraries(soccer_radar PRIVATE ${FINAL_OPENCV_LIBS} "${FIRST_ONNX_DYLIB}")
 else()
     target_link_libraries(soccer_radar PRIVATE ${FINAL_OPENCV_LIBS} onnxruntime)
 endif()

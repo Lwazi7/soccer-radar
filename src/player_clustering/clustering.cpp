@@ -4,6 +4,8 @@
 #include <numeric>
 #include <random>
 #include <iostream>
+#include <limits>
+#include <opencv2/core.hpp>
 
 namespace soccer_radar {
 
@@ -17,7 +19,6 @@ void ClusteringManager::pca_fit(const std::vector<std::vector<float>>& data) {
     int n_samples = static_cast<int>(data.size());
     int dim = static_cast<int>(data[0].size());
 
-    // Compute mean
     pca_mean_.assign(dim, 0.0f);
     for (const auto& sample : data) {
         for (int i = 0; i < dim; ++i) {
@@ -26,7 +27,6 @@ void ClusteringManager::pca_fit(const std::vector<std::vector<float>>& data) {
     }
     for (float& m : pca_mean_) m /= static_cast<float>(n_samples);
 
-    // Compute covariance matrix (centered data)
     std::vector<float> cov(dim * dim, 0.0f);
 
     for (const auto& sample : data) {
@@ -39,7 +39,6 @@ void ClusteringManager::pca_fit(const std::vector<std::vector<float>>& data) {
         }
     }
 
-    // Symmetrize and normalize
     for (int i = 0; i < dim; ++i) {
         for (int j = i; j < dim; ++j) {
             cov[i * dim + j] /= static_cast<float>(std::max(1, n_samples - 1));
@@ -47,66 +46,14 @@ void ClusteringManager::pca_fit(const std::vector<std::vector<float>>& data) {
         }
     }
 
-    pca_components_.resize(static_cast<size_t>(n_components_ * dim), 0.0f);
-
-    std::mt19937 rng(42);
-    std::normal_distribution<float> normal(0, 1);
-
-    std::vector<float> temp_cov = cov;
-
-    for (int comp = 0; comp < n_components_; ++comp) {
-        std::vector<float> v(dim);
-        for (float& vi : v) vi = normal(rng);
-
-        // Power iteration with Gram-Schmidt orthogonalization against previous components
-        for (int iter = 0; iter < 30; ++iter) {
-            std::vector<float> v_new(dim, 0.0f);
-
-            for (int i = 0; i < dim; ++i) {
-                for (int j = 0; j < dim; ++j) {
-                    v_new[i] += temp_cov[i * dim + j] * v[j];
-                }
-            }
-
-            // Gram-Schmidt orthogonalization against previously found principal components
-            for (int p = 0; p < comp; ++p) {
-                float dot = 0.0f;
-                for (int d = 0; d < dim; ++d) {
-                    dot += v_new[d] * pca_components_[p * dim + d];
-                }
-                for (int d = 0; d < dim; ++d) {
-                    v_new[d] -= dot * pca_components_[p * dim + d];
-                }
-            }
-
-            // Normalize
-            float norm = 0.0f;
-            for (float vi : v_new) norm += vi * vi;
-            norm = std::sqrt(norm);
-            if (norm > 1e-8f) {
-                for (float& vi : v_new) vi /= norm;
-            }
-
-            v = std::move(v_new);
-        }
-
-        std::copy(v.begin(), v.end(), pca_components_.begin() + comp * dim);
-
-        // Compute eigenvalue: lambda = v^T * cov * v
-        float eigenvalue = 0.0f;
-        for (int i = 0; i < dim; ++i) {
-            float cv_i = 0.0f;
-            for (int j = 0; j < dim; ++j) {
-                cv_i += temp_cov[i * dim + j] * v[j];
-            }
-            eigenvalue += v[i] * cv_i;
-        }
-
-        // Deflate
-        for (int i = 0; i < dim; ++i) {
-            for (int j = 0; j < dim; ++j) {
-                temp_cov[i * dim + j] -= eigenvalue * v[i] * v[j];
-            }
+    // Exact LAPACK precision eigensolver via OpenCV (eliminates O(dim^3) power iteration loop)
+    cv::Mat cov_mat(dim, dim, CV_32FC1, cov.data());
+    cv::Mat eigenvalues, eigenvectors;
+    if (cv::eigen(cov_mat, eigenvalues, eigenvectors)) {
+        pca_components_.resize(static_cast<size_t>(n_components_ * dim), 0.0f);
+        for (int c = 0; c < n_components_ && c < eigenvectors.rows; ++c) {
+            const float* row_ptr = eigenvectors.ptr<float>(c);
+            std::copy(row_ptr, row_ptr + dim, pca_components_.begin() + c * dim);
         }
     }
 }
@@ -140,80 +87,91 @@ void ClusteringManager::kmeans_fit(const std::vector<std::vector<float>>& data) 
     int n_samples = static_cast<int>(data.size());
     int dim = static_cast<int>(data[0].size());
 
-    std::mt19937 rng(42);
-    kmeans_centroids_.clear();
+    double best_inertia = std::numeric_limits<double>::max();
+    std::vector<std::vector<float>> best_centroids;
 
-    std::uniform_int_distribution<int> uniform(0, n_samples - 1);
-    kmeans_centroids_.push_back(data[uniform(rng)]);
+    // Multi-restart K-Means++ (3 independent random initializations) for global cluster optimality
+    for (int init_run = 0; init_run < 3; ++init_run) {
+        std::mt19937 rng(42 + init_run * 17);
+        std::vector<std::vector<float>> centroids;
 
-    for (int k = 1; k < n_clusters_; ++k) {
-        std::vector<float> distances(n_samples, std::numeric_limits<float>::max());
+        std::uniform_int_distribution<int> uniform(0, n_samples - 1);
+        centroids.push_back(data[uniform(rng)]);
 
-        for (int i = 0; i < n_samples; ++i) {
-            for (const auto& centroid : kmeans_centroids_) {
-                float dist = 0.0f;
-                for (int d = 0; d < dim; ++d) {
-                    float diff = data[i][d] - centroid[d];
-                    dist += diff * diff;
+        for (int k = 1; k < n_clusters_; ++k) {
+            std::vector<float> distances(n_samples, std::numeric_limits<float>::max());
+            for (int i = 0; i < n_samples; ++i) {
+                for (const auto& centroid : centroids) {
+                    float dist = 0.0f;
+                    for (int d = 0; d < dim; ++d) {
+                        float diff = data[i][d] - centroid[d];
+                        dist += diff * diff;
+                    }
+                    distances[i] = std::min(distances[i], dist);
                 }
-                distances[i] = std::min(distances[i], dist);
             }
+            std::discrete_distribution<int> weighted(distances.begin(), distances.end());
+            centroids.push_back(data[weighted(rng)]);
         }
 
-        std::discrete_distribution<int> weighted(distances.begin(), distances.end());
-        kmeans_centroids_.push_back(data[weighted(rng)]);
-    }
+        std::vector<int> assignments(n_samples, 0);
+        for (int iter = 0; iter < KMEANS_MAX_ITER; ++iter) {
+            bool changed = false;
+            for (int i = 0; i < n_samples; ++i) {
+                float min_dist = std::numeric_limits<float>::max();
+                int best_cluster = 0;
+                for (int k = 0; k < n_clusters_; ++k) {
+                    float dist = 0.0f;
+                    for (int d = 0; d < dim; ++d) {
+                        float diff = data[i][d] - centroids[k][d];
+                        dist += diff * diff;
+                    }
+                    if (dist < min_dist) {
+                        min_dist = dist;
+                        best_cluster = k;
+                    }
+                }
+                if (assignments[i] != best_cluster) {
+                    assignments[i] = best_cluster;
+                    changed = true;
+                }
+            }
 
-    std::vector<int> assignments(n_samples, 0);
+            if (!changed) break;
 
-    for (int iter = 0; iter < KMEANS_MAX_ITER; ++iter) {
-        bool changed = false;
-
-        for (int i = 0; i < n_samples; ++i) {
-            float min_dist = std::numeric_limits<float>::max();
-            int best_cluster = 0;
-
+            std::vector<std::vector<float>> new_centroids(n_clusters_, std::vector<float>(dim, 0.0f));
+            std::vector<int> counts(n_clusters_, 0);
+            for (int i = 0; i < n_samples; ++i) {
+                int k = assignments[i];
+                counts[k]++;
+                for (int d = 0; d < dim; ++d) new_centroids[k][d] += data[i][d];
+            }
             for (int k = 0; k < n_clusters_; ++k) {
-                float dist = 0.0f;
-                for (int d = 0; d < dim; ++d) {
-                    float diff = data[i][d] - kmeans_centroids_[k][d];
-                    dist += diff * diff;
-                }
-                if (dist < min_dist) {
-                    min_dist = dist;
-                    best_cluster = k;
+                if (counts[k] > 0) {
+                    for (int d = 0; d < dim; ++d) new_centroids[k][d] /= static_cast<float>(counts[k]);
                 }
             }
-
-            if (assignments[i] != best_cluster) {
-                assignments[i] = best_cluster;
-                changed = true;
-            }
+            centroids = std::move(new_centroids);
         }
 
-        if (!changed) break;
-
-        std::vector<std::vector<float>> new_centroids(n_clusters_, std::vector<float>(dim, 0.0f));
-        std::vector<int> counts(n_clusters_, 0);
-
+        double total_inertia = 0.0;
         for (int i = 0; i < n_samples; ++i) {
             int k = assignments[i];
-            counts[k]++;
+            double dist_sq = 0.0;
             for (int d = 0; d < dim; ++d) {
-                new_centroids[k][d] += data[i][d];
+                double diff = static_cast<double>(data[i][d] - centroids[k][d]);
+                dist_sq += diff * diff;
             }
+            total_inertia += dist_sq;
         }
 
-        for (int k = 0; k < n_clusters_; ++k) {
-            if (counts[k] > 0) {
-                for (int d = 0; d < dim; ++d) {
-                    new_centroids[k][d] /= static_cast<float>(counts[k]);
-                }
-            }
+        if (total_inertia < best_inertia) {
+            best_inertia = total_inertia;
+            best_centroids = std::move(centroids);
         }
-
-        kmeans_centroids_ = std::move(new_centroids);
     }
+
+    kmeans_centroids_ = std::move(best_centroids);
 }
 
 std::vector<int> ClusteringManager::kmeans_predict(const std::vector<std::vector<float>>& data) {

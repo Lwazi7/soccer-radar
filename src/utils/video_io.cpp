@@ -2,6 +2,7 @@
 #include <opencv2/videoio.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <filesystem>
+#include <iostream>
 
 namespace soccer_radar {
 
@@ -13,56 +14,30 @@ VideoReader::VideoReader(const std::string& path) {
     open(path);
 }
 
-VideoReader::~VideoReader() {
-    close();
-}
-
-VideoReader::VideoReader(VideoReader&& other) noexcept
-    : cap_(other.cap_), width_(other.width_), height_(other.height_),
-      fps_(other.fps_), total_frames_(other.total_frames_) {
-    other.cap_ = nullptr;
-}
-
-VideoReader& VideoReader::operator=(VideoReader&& other) noexcept {
-    if (this != &other) {
-        close();
-        cap_ = other.cap_;
-        width_ = other.width_;
-        height_ = other.height_;
-        fps_ = other.fps_;
-        total_frames_ = other.total_frames_;
-        other.cap_ = nullptr;
-    }
-    return *this;
-}
-
 bool VideoReader::open(const std::string& path) {
     close();
-    auto* cap = new cv::VideoCapture(path);
-    if (!cap->isOpened()) {
-        delete cap;
+    cap_ = std::make_unique<cv::VideoCapture>(path);
+    if (!cap_->isOpened()) {
+        cap_.reset();
         return false;
     }
-    cap_ = cap;
-    width_ = static_cast<int>(cap->get(cv::CAP_PROP_FRAME_WIDTH));
-    height_ = static_cast<int>(cap->get(cv::CAP_PROP_FRAME_HEIGHT));
-    fps_ = cap->get(cv::CAP_PROP_FPS);
-    total_frames_ = static_cast<int>(cap->get(cv::CAP_PROP_FRAME_COUNT));
+    width_ = static_cast<int>(cap_->get(cv::CAP_PROP_FRAME_WIDTH));
+    height_ = static_cast<int>(cap_->get(cv::CAP_PROP_FRAME_HEIGHT));
+    fps_ = cap_->get(cv::CAP_PROP_FPS);
+    total_frames_ = static_cast<int>(cap_->get(cv::CAP_PROP_FRAME_COUNT));
     return true;
 }
 
 bool VideoReader::read(cv::Mat& frame) {
-    if (!cap_) return false;
-    auto* cap = static_cast<cv::VideoCapture*>(cap_);
-    return cap->read(frame);
+    if (!is_open()) return false;
+    if (!cap_->read(frame) || frame.empty()) return false;
+    return true;
 }
 
 void VideoReader::close() {
     if (cap_) {
-        auto* cap = static_cast<cv::VideoCapture*>(cap_);
-        cap->release();
-        delete cap;
-        cap_ = nullptr;
+        cap_->release();
+        cap_.reset();
     }
 }
 
@@ -70,37 +45,37 @@ void VideoReader::close() {
 // VideoWriter
 // ============================================================================
 
-VideoWriter::~VideoWriter() {
-    close();
-}
-
 bool VideoWriter::open(const std::string& path, int width, int height, double fps) {
     close();
 
-    // Use H.264 (mp4v) codec which is widely supported
-    int fourcc = cv::VideoWriter::fourcc('m', 'p', '4', 'v');
-    auto* writer = new cv::VideoWriter(path, fourcc, fps, cv::Size(width, height));
-    if (!writer->isOpened()) {
-        delete writer;
-        return false;
+    // Multi-codec probe: avc1 -> h264 -> mp4v -> XVID
+    int codecs[] = {
+        cv::VideoWriter::fourcc('a', 'v', 'c', '1'),
+        cv::VideoWriter::fourcc('h', '2', '6', '4'),
+        cv::VideoWriter::fourcc('m', 'p', '4', 'v'),
+        cv::VideoWriter::fourcc('X', 'V', 'I', 'D')
+    };
+
+    for (int fourcc : codecs) {
+        writer_ = std::make_unique<cv::VideoWriter>(path, fourcc, fps, cv::Size(width, height));
+        if (writer_->isOpened()) {
+            return true;
+        }
+        writer_.reset();
     }
-    writer_ = writer;
-    return true;
+    return false;
 }
 
 bool VideoWriter::write(const cv::Mat& frame) {
-    if (!writer_) return false;
-    auto* w = static_cast<cv::VideoWriter*>(writer_);
-    w->write(frame);
+    if (!is_open() || frame.empty()) return false;
+    writer_->write(frame);
     return true;
 }
 
 void VideoWriter::close() {
     if (writer_) {
-        auto* w = static_cast<cv::VideoWriter*>(writer_);
-        w->release();
-        delete w;
-        writer_ = nullptr;
+        writer_->release();
+        writer_.reset();
     }
 }
 
