@@ -4,8 +4,13 @@ project(SoccerRadar VERSION 2.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Compiler optimizations for high-performance mobile/desktop C++
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -funroll-loops -ffast-math -fomit-frame-pointer -Wno-nan-infinity-disabled")
+# Release optimization. Fast-math is opt-in because it can invalidate Kalman/PCA
+# finite-value checks and is unsafe for numerically sensitive production builds.
+add_compile_options($<$<CONFIG:Release>:-O3> $<$<CONFIG:Release>:-funroll-loops>)
+option(SOCCER_RADAR_FAST_MATH "Enable unsafe floating-point reassociation" OFF)
+if(SOCCER_RADAR_FAST_MATH)
+    add_compile_options($<$<CONFIG:Release>:-ffast-math>)
+endif()
 
 # Architecture optimization (auto-detect ARM64 / Termux NEON SIMD)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
@@ -14,7 +19,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
 endif()
 
 # Find OpenCV
-find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs videoio calib3d)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs videoio video calib3d)
 
 # Locate ONNX Runtime seamlessly across Termux, command line (-DONNXRUNTIME_ROOT=...), environment variables, or Linux paths
 if(DEFINED ONNXRUNTIME_ROOT AND EXISTS "${ONNXRUNTIME_ROOT}")
@@ -81,6 +86,7 @@ set(OPENCV_TERMUX_SO
     "/data/data/com.termux/files/usr/lib/libopencv_imgproc.so"
     "/data/data/com.termux/files/usr/lib/libopencv_imgcodecs.so"
     "/data/data/com.termux/files/usr/lib/libopencv_videoio.so"
+    "/data/data/com.termux/files/usr/lib/libopencv_video.so"
     "/data/data/com.termux/files/usr/lib/libopencv_calib3d.so"
 )
 
@@ -101,4 +107,18 @@ elseif(ONNX_DYLIB)
     target_link_libraries(soccer_radar PRIVATE ${FINAL_OPENCV_LIBS} "${FIRST_ONNX_DYLIB}")
 else()
     target_link_libraries(soccer_radar PRIVATE ${FINAL_OPENCV_LIBS} onnxruntime)
+endif()
+target_link_libraries(soccer_radar PRIVATE ${CMAKE_DL_LIBS})
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(soccer_radar_core_tests
+        tests/core_tests.cpp
+        src/object_tracking/tracker.cpp
+        src/pipelines/processing_pipeline.cpp
+    )
+    target_include_directories(soccer_radar_core_tests PRIVATE
+        ${CMAKE_SOURCE_DIR}/include ${ALL_OPENCV_INCLUDE_PATHS})
+    target_link_libraries(soccer_radar_core_tests PRIVATE ${FINAL_OPENCV_LIBS})
+    add_test(NAME soccer_radar_core_tests COMMAND soccer_radar_core_tests)
 endif()

@@ -63,7 +63,7 @@ void Annotator::draw_track_labels(cv::Mat& frame, const Detections& detections) 
         int base_line = 0;
         cv::Size size = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &base_line);
 
-        int x = static_cast<int>(box.cx() - size.width * 0.5f);
+        int x = static_cast<int>(box.cx() - static_cast<float>(size.width) * 0.5f);
         int y = static_cast<int>(box.y1 - 5);
 
         cv::rectangle(frame,

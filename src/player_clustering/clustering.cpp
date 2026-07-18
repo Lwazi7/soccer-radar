@@ -14,47 +14,25 @@ ClusteringManager::ClusteringManager(int n_components, int n_clusters)
 }
 
 void ClusteringManager::pca_fit(const std::vector<std::vector<float>>& data) {
-    if (data.empty()) return;
-
-    int n_samples = static_cast<int>(data.size());
-    int dim = static_cast<int>(data[0].size());
-
-    pca_mean_.assign(dim, 0.0f);
-    for (const auto& sample : data) {
-        for (int i = 0; i < dim; ++i) {
-            pca_mean_[i] += sample[i];
-        }
-    }
-    for (float& m : pca_mean_) m /= static_cast<float>(n_samples);
-
-    std::vector<float> cov(dim * dim, 0.0f);
-
-    for (const auto& sample : data) {
-        for (int i = 0; i < dim; ++i) {
-            float xi = sample[i] - pca_mean_[i];
-            for (int j = i; j < dim; ++j) {
-                float xj = sample[j] - pca_mean_[j];
-                cov[i * dim + j] += xi * xj;
-            }
-        }
+    if (data.empty() || data.front().empty()) return;
+    const int samples = static_cast<int>(data.size());
+    const int dim = static_cast<int>(data.front().size());
+    cv::Mat rows(samples, dim, CV_32F);
+    for (int r = 0; r < samples; ++r) {
+        if (static_cast<int>(data[r].size()) != dim) return;
+        std::copy(data[r].begin(), data[r].end(), rows.ptr<float>(r));
     }
 
-    for (int i = 0; i < dim; ++i) {
-        for (int j = i; j < dim; ++j) {
-            cov[i * dim + j] /= static_cast<float>(std::max(1, n_samples - 1));
-            cov[j * dim + i] = cov[i * dim + j];
-        }
-    }
-
-    // Exact LAPACK precision eigensolver via OpenCV (eliminates O(dim^3) power iteration loop)
-    cv::Mat cov_mat(dim, dim, CV_32FC1, cov.data());
-    cv::Mat eigenvalues, eigenvectors;
-    if (cv::eigen(cov_mat, eigenvalues, eigenvectors)) {
-        pca_components_.resize(static_cast<size_t>(n_components_ * dim), 0.0f);
-        for (int c = 0; c < n_components_ && c < eigenvectors.rows; ++c) {
-            const float* row_ptr = eigenvectors.ptr<float>(c);
-            std::copy(row_ptr, row_ptr + dim, pca_components_.begin() + c * dim);
-        }
+    // OpenCV's PCA selects the sample-space decomposition when samples << features,
+    // avoiding construction/eigendecomposition of a 1280x1280 covariance matrix.
+    const int components = std::min({n_components_, samples, dim});
+    cv::PCA pca(rows, cv::Mat(), cv::PCA::DATA_AS_ROW, components);
+    pca_mean_.assign(pca.mean.ptr<float>(), pca.mean.ptr<float>() + dim);
+    pca_components_.assign(static_cast<size_t>(n_components_ * dim), 0.0f);
+    for (int c = 0; c < components; ++c) {
+        std::copy(pca.eigenvectors.ptr<float>(c),
+                  pca.eigenvectors.ptr<float>(c) + dim,
+                  pca_components_.begin() + static_cast<size_t>(c * dim));
     }
 }
 
@@ -90,8 +68,8 @@ void ClusteringManager::kmeans_fit(const std::vector<std::vector<float>>& data) 
     double best_inertia = std::numeric_limits<double>::max();
     std::vector<std::vector<float>> best_centroids;
 
-    // Multi-restart K-Means++ (3 independent random initializations) for global cluster optimality
-    for (int init_run = 0; init_run < 3; ++init_run) {
+    // Multi-restart K-Means++ for global cluster optimality.
+    for (int init_run = 0; init_run < KMEANS_RESTARTS; ++init_run) {
         std::mt19937 rng(42 + init_run * 17);
         std::vector<std::vector<float>> centroids;
 
@@ -210,11 +188,45 @@ void ClusteringManager::train(const std::vector<std::vector<float>>& embeddings)
     auto reduced = pca_transform(embeddings);
     kmeans_fit(reduced);
 
+    // Standard mean silhouette score. Training is intentionally small (normally 120
+    // crops), so the O(n^2) validity check is cheap and runs only once per video.
+    auto labels = kmeans_predict(reduced);
+    double total = 0.0;
+    int scored = 0;
+    for (size_t i = 0; i < reduced.size(); ++i) {
+        double same_sum = 0.0, other_sum = 0.0;
+        int same_count = 0, other_count = 0;
+        for (size_t j = 0; j < reduced.size(); ++j) {
+            if (i == j) continue;
+            double d2 = 0.0;
+            for (size_t k = 0; k < reduced[i].size(); ++k) {
+                const double d = reduced[i][k] - reduced[j][k];
+                d2 += d * d;
+            }
+            const double distance = std::sqrt(d2);
+            if (labels[j] == labels[i]) { same_sum += distance; ++same_count; }
+            else { other_sum += distance; ++other_count; }
+        }
+        if (same_count > 0 && other_count > 0) {
+            const double a = same_sum / same_count;
+            const double b = other_sum / other_count;
+            total += (b - a) / std::max(a, b);
+            ++scored;
+        }
+    }
+    silhouette_score_ = scored > 0 ? static_cast<float>(total / scored) : -1.0f;
+    cluster_separation_valid_ = silhouette_score_ >= MIN_CLUSTER_SILHOUETTE;
+    if (!cluster_separation_valid_) {
+        std::cerr << "[Clustering] Team separation rejected (silhouette="
+                  << silhouette_score_ << "); using a single-team fallback." << std::endl;
+    }
     is_trained_ = true;
 }
 
 std::vector<int> ClusteringManager::predict(const std::vector<std::vector<float>>& embeddings) {
-    if (!is_trained_ || embeddings.empty()) return std::vector<int>(embeddings.size(), 0);
+    if (!is_trained_ || embeddings.empty() || !cluster_separation_valid_) {
+        return std::vector<int>(embeddings.size(), 0);
+    }
 
     auto reduced = pca_transform(embeddings);
     return kmeans_predict(reduced);

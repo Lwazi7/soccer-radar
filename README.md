@@ -1,4 +1,6 @@
-# ⚽ Soccer Radar v2.0 (Production-Ready Mobile C++ Rewrite)
+# ⚽ Soccer Radar v2.1 (Production-Hardened Mobile C++ Rewrite)
+
+> See [PRODUCTION_UPDATES.md](PRODUCTION_UPDATES.md) for the hardening changes, test instructions, and target-device validation caveat.
 
 A high-performance, real-time C++ rewrite of the [`Soccer_Analysis`](https://github.com/Adit-jain/Soccer_Analysis) Python pipeline, engineered specifically to run at high FPS and high accuracy on constrained mobile devices (`aarch64` / Android Termux / Linux).
 
@@ -8,9 +10,9 @@ A high-performance, real-time C++ rewrite of the [`Soccer_Analysis`](https://git
 
 | Component | Python Original (`Soccer_Analysis`) | Previous Rewrite (v1.0) | **Soccer Radar v2.0 (Production-Ready)** |
 | :--- | :--- | :--- | :--- |
-| **Tracking Engine** | `supervision.ByteTrack()` (Hungarian LAP solver with `det_high` + `det_low` + `lost_tracks` recovery) | Single-threshold greedy match (`update`); lost tracks discarded after occlusion | **True 3-Stage ByteTrack (`ByteTracker::update`)** with `det_high` ($\ge 0.45$), `det_low` ($\ge 0.15$ occlusion recovery), and automatic `lost_tracks_` re-association. |
-| **Tactical Pitch Alignment** | Computed on **every frame** via `ViewTransformer` | Computed once every **30 frames** (freezes during camera pans) | **Dynamic Camera Drift Monitoring (`HomographyTransformer`)** checking visible keypoint confidence ($\ge 4$ points) across intervals to eliminate pitch warping across pans. |
-| **Player Clustering** | `SiglipVisionModel` (86M params) $\rightarrow$ UMAP (3D) $\rightarrow$ K-Means | `mobilenetv4_conv_small.onnx` $\rightarrow$ PCA (with deflation error) $\rightarrow$ K-Means | **Orthonormal Gram-Schmidt PCA (`pca_fit`) + K-Means++**, guaranteeing stable team separation without external UMAP dependencies. |
+| **Tracking Engine** | `supervision.ByteTrack()` (Hungarian LAP solver with `det_high` + `det_low` + `lost_tracks` recovery) | Single-threshold greedy match (`update`); lost tracks discarded after occlusion | **Rectangular Hungarian + two-tier ByteTrack + appearance Re-ID**, with confidence-ranked top-K bounding and 120-frame lost-track retention. |
+| **Tactical Pitch Alignment** | Computed on **every frame** via `ViewTransformer` | Computed once every **30 frames** (freezes during camera pans) | **PROSAC-style estimation + Lucas–Kanade keypoint propagation + temporal smoothing** between detector refreshes. |
+| **Player Clustering** | `SiglipVisionModel` (86M params) $\rightarrow$ UMAP (3D) $\rightarrow$ K-Means | `mobilenetv4_conv_small.onnx` $\rightarrow$ PCA (with deflation error) $\rightarrow$ K-Means | **Sample-space OpenCV PCA + K-Means++ + silhouette validation**, with a safe single-team fallback when separation is unreliable. |
 | **Embedding Execution** | Batched PyTorch tensor evaluation (`chunked(24)`) | Sequential single-crop `session->Run()` loops (`extract_batch`) | **Vectorized & Batched ONNX Execution (`extract_batch`)**, processing entire frame player crops in a single SIMD/NPU tensor pass. |
 | **Hardware Acceleration** | PyTorch CUDA/CPU | ONNX Runtime Default CPU Provider only | **Android XNNPACK / NNAPI Hardware Delegates**, automatically leveraging mobile SIMD/NEON instructions and Neural Processing Units (NPUs). |
 | **Build Portability** | Python module dynamic paths | Hardcoded `/data/data/com.termux/files/...` paths | **Cross-Platform `CMakeLists.txt`**, auto-detecting system or Termux OpenCV/ONNX paths seamlessly. |

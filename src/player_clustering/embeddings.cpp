@@ -196,21 +196,20 @@ std::vector<std::vector<float>> EmbeddingExtractor::extract_batch(
     const size_t hw = static_cast<size_t>(input_height_ * input_width_);
     const size_t chw = 3 * hw;
 
-    std::vector<float> batched_blob(batch_size * chw);
+    batch_input_blob_.resize(batch_size * chw);
 
     constexpr float mean_r = 0.485f, mean_g = 0.456f, mean_b = 0.406f;
     constexpr float std_r = 0.229f, std_g = 0.224f, std_b = 0.225f;
 
     for (size_t b = 0; b < batch_size; ++b) {
-        cv::Mat resized;
-        cv::resize(crops[b], resized, cv::Size(input_width_, input_height_));
+        cv::resize(crops[b], resize_scratch_, cv::Size(input_width_, input_height_));
         
-        float* ch_r = batched_blob.data() + b * chw;
+        float* ch_r = batch_input_blob_.data() + b * chw;
         float* ch_g = ch_r + hw;
         float* ch_b = ch_g + hw;
 
         for (int r = 0; r < input_height_; ++r) {
-            const uint8_t* row_ptr = resized.ptr<uint8_t>(r);
+            const uint8_t* row_ptr = resize_scratch_.ptr<uint8_t>(r);
             const int row_offset = r * input_width_;
             for (int c = 0; c < input_width_; ++c) {
                 const int src_idx = c * 3;
@@ -226,16 +225,16 @@ std::vector<std::vector<float>> EmbeddingExtractor::extract_batch(
     Ort::Value input_tensor{nullptr};
 
     if (input_elem_type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
-        std::vector<Ort::Float16_t> batched_fp16(batched_blob.size());
-        for (size_t i = 0; i < batched_blob.size(); ++i) {
-            batched_fp16[i] = float_to_half(batched_blob[i]);
+        batch_input_fp16_.resize(batch_input_blob_.size());
+        for (size_t i = 0; i < batch_input_blob_.size(); ++i) {
+            batch_input_fp16_[i] = float_to_half(batch_input_blob_[i]);
         }
         input_tensor = Ort::Value::CreateTensor<Ort::Float16_t>(
-            *mem_info_, batched_fp16.data(), batched_fp16.size(),
+            *mem_info_, batch_input_fp16_.data(), batch_input_fp16_.size(),
             input_shape.data(), input_shape.size());
     } else {
         input_tensor = Ort::Value::CreateTensor<float>(
-            *mem_info_, batched_blob.data(), batched_blob.size(),
+            *mem_info_, batch_input_blob_.data(), batch_input_blob_.size(),
             input_shape.data(), input_shape.size());
     }
 
@@ -251,21 +250,21 @@ std::vector<std::vector<float>> EmbeddingExtractor::extract_batch(
     size_t elements_per_sample = 1;
     for (size_t i = 1; i < shape.size(); ++i) elements_per_sample *= static_cast<size_t>(shape[i]);
 
-    std::vector<float> batched_out_float(batch_size * elements_per_sample);
+    batch_output_data_.resize(batch_size * elements_per_sample);
     if (output_elem_type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
         Ort::Float16_t* out_fp16 = output_tensor.GetTensorMutableData<Ort::Float16_t>();
-        for (size_t i = 0; i < batched_out_float.size(); ++i) {
-            batched_out_float[i] = half_to_float(out_fp16[i]);
+        for (size_t i = 0; i < batch_output_data_.size(); ++i) {
+            batch_output_data_[i] = half_to_float(out_fp16[i]);
         }
     } else {
         float* out_ptr = output_tensor.GetTensorMutableData<float>();
-        std::copy(out_ptr, out_ptr + batched_out_float.size(), batched_out_float.begin());
+        std::copy(out_ptr, out_ptr + batch_output_data_.size(), batch_output_data_.begin());
     }
 
     std::vector<std::vector<float>> results(batch_size, std::vector<float>(embedding_dim_, 0.0f));
 
     for (size_t b = 0; b < batch_size; ++b) {
-        float* sample_ptr = batched_out_float.data() + b * elements_per_sample;
+        float* sample_ptr = batch_output_data_.data() + b * elements_per_sample;
         auto& emb = results[b];
 
         if (elements_per_sample == static_cast<size_t>(embedding_dim_)) {

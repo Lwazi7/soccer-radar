@@ -35,7 +35,7 @@ public:
     int input_height() const { return input_height_; }
 
 private:
-    void preprocess(const cv::Mat& frame, std::vector<float>& blob);
+    void preprocess(const cv::Mat& frame);
     void postprocess(const std::vector<float>& output,
                      int output_rows, int output_cols,
                      Detections& out);

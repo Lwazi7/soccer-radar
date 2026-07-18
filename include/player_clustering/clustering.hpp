@@ -36,6 +36,8 @@ public:
     const EmbeddingExtractor& get_extractor() const { return extractor_; }
 
     bool is_trained() const { return is_trained_; }
+    bool has_valid_team_separation() const { return cluster_separation_valid_; }
+    float silhouette_score() const { return silhouette_score_; }
 
 private:
     // PCA implementation (fit and transform)
@@ -50,6 +52,8 @@ private:
     int n_components_;
     int n_clusters_;
     bool is_trained_{false};
+    bool cluster_separation_valid_{false};
+    float silhouette_score_{-1.0f};
 
     // PCA parameters
     std::vector<float> pca_mean_;       // Mean vector (dim)

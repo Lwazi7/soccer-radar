@@ -46,6 +46,10 @@ private:
     std::vector<float> input_blob_;
     std::vector<Ort::Float16_t> input_blob_fp16_;
     std::vector<float> output_data_;
+    std::vector<float> batch_input_blob_;
+    std::vector<Ort::Float16_t> batch_input_fp16_;
+    std::vector<float> batch_output_data_;
+    cv::Mat resize_scratch_;
     std::string input_name_;
     std::vector<std::string> output_names_;
 };

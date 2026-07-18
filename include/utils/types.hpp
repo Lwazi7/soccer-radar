@@ -118,10 +118,15 @@ struct TrackState {
     int    referee_vote_count{0};
     int    team0_vote_count{0};
     int    team1_vote_count{0};
+    std::vector<int> team_vote_history;
 
     // Kalman state: [cx, cy, w, h, vx, vy, vw, vh]
     std::array<float, 8> state{};
     std::array<float, 64> covariance{};
+
+    // L2-normalized MobileNet appearance descriptor, updated with an EMA.
+    // Kept on both active and lost tracks for occlusion re-identification.
+    std::vector<float> appearance;
 };
 
 // ============================================================================
@@ -145,6 +150,10 @@ struct TacticalMetadata {
     int  num_referees{0};
     bool transform_valid{false};
     bool is_replay{false};
+    std::vector<std::array<float,2>> team1_pitch;
+    std::vector<std::array<float,2>> team2_pitch;
+    std::vector<std::array<float,2>> ball_pitch;
+    std::vector<std::array<float,2>> referee_pitch;
 };
 
 } // namespace soccer_radar

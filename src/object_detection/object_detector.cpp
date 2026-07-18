@@ -74,16 +74,14 @@ bool ObjectDetector::load_model(const std::string& model_path) {
     }
 }
 
-void ObjectDetector::preprocess(const cv::Mat& frame, std::vector<float>& blob) {
+void ObjectDetector::preprocess(const cv::Mat& frame) {
     letterbox_frame(frame, letterboxed_,
                     input_width_, input_height_,
                     LETTERBOX_PAD_TOP, LETTERBOX_PAD_BOTTOM,
                     LETTERBOX_PAD_LEFT, LETTERBOX_PAD_RIGHT);
 
     const int hw = input_height_ * input_width_;
-    blob.resize(static_cast<size_t>(3 * hw));
-
-    float* ch_r = blob.data();
+    float* ch_r = input_blob_.data();
     float* ch_g = ch_r + hw;
     float* ch_b = ch_g + hw;
 
@@ -254,7 +252,7 @@ void ObjectDetector::detect(const cv::Mat& frame,
     if (!session_) return;
 
     auto t0 = std::chrono::steady_clock::now();
-    preprocess(frame, input_blob_);
+    preprocess(frame);
     auto t1 = std::chrono::steady_clock::now();
 
     std::array<int64_t, 4> input_shape = {1, 3, input_height_, input_width_};

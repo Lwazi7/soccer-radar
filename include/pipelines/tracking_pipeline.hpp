@@ -52,6 +52,7 @@ private:
 
     std::unordered_map<int, int> team_cache_;
     std::unordered_map<int, int> last_validation_frame_;
+    std::unordered_map<int, std::vector<float>> frame_reid_features_;
     static constexpr int REVALIDATE_INTERVAL = 60;
     int frame_idx_global_{0};
 

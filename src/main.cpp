@@ -60,7 +60,7 @@ static void print_progress_bar(int current, int total, double elapsed_ms, const 
     if (total <= 0) return;
     int width = 30;
     float pct = static_cast<float>(current) / static_cast<float>(total);
-    int pos = static_cast<int>(width * pct);
+    int pos = static_cast<int>(static_cast<float>(width) * pct);
 
     double fps = (elapsed_ms > 0) ? (1000.0 * current / elapsed_ms) : 0.0;
     int eta_s = (fps > 0) ? static_cast<int>((total - current) / fps) : 0;
@@ -150,8 +150,9 @@ public:
         std::unordered_map<int, std::unordered_map<int, int>>  video_player_teams;
         std::unordered_map<int, BBox>                          video_ball_tracks;
         std::unordered_map<int, std::unordered_map<int, BBox>> video_referee_tracks;
-        std::unordered_map<int, cv::Mat>                       tactical_frames;
-        std::unordered_map<int, TacticalMetadata>              tactical_metadata;
+        // Store compact pitch coordinates, never full tactical images, to keep memory
+        // bounded during the second-pass annotation workflow.
+        std::unordered_map<int, TacticalMetadata> tactical_metadata;
 
         cv::Mat frame;
         int frame_idx = 0;
@@ -214,13 +215,12 @@ public:
 
             auto t2 = std::chrono::steady_clock::now();
             TacticalMetadata metadata;
-            cv::Mat tactical_frame = tactical_pipeline_.process_frame(
-                players, balls, referees, cached_corners, metadata);
+            tactical_pipeline_.process_frame(
+                frame, players, balls, referees, cached_corners, metadata, false);
             auto t3 = std::chrono::steady_clock::now();
             total_tactical_ms += std::chrono::duration<double, std::milli>(t3 - t2).count();
 
-            tactical_frames[frame_idx] = tactical_frame.clone();
-            tactical_metadata[frame_idx] = metadata;
+            tactical_metadata[frame_idx] = std::move(metadata);
 
             frame_idx++;
             processed_count++;
@@ -230,7 +230,8 @@ public:
 
             if (verbose_) {
                 if (processed_count % 10 == 0 || processed_count == max_frames || processed_count <= 3) {
-                    float fps = 1000.0f * processed_count / static_cast<float>(std::max<int64_t>(16, static_cast<int64_t>(elapsed_ms)));
+                    float fps = 1000.0f * static_cast<float>(processed_count) /
+                                static_cast<float>(std::max<int64_t>(16, static_cast<int64_t>(elapsed_ms)));
                     double avg_det_total = (tt.det_preprocess_ms + tt.det_onnx_run_ms + tt.det_postprocess_ms + tt.tracker_update_ms + tt.clustering_ms);
                     std::cout << "  Frame " << frame_idx << "/" << target_total
                               << " | " << std::fixed << std::setprecision(2) << fps << " fps"
@@ -298,8 +299,14 @@ public:
                                                    video_ball_tracks[pass2_idx],
                                                    video_referee_tracks[pass2_idx]);
 
+                const auto& meta = tactical_metadata[pass2_idx];
+                cv::Mat tactical = HomographyTransformer::draw_pitch(
+                    PITCH_DRAW_WIDTH, PITCH_DRAW_HEIGHT);
+                HomographyTransformer::draw_positions_on_pitch(
+                    tactical, meta.team1_pitch, meta.team2_pitch,
+                    meta.ball_pitch, meta.referee_pitch);
                 cv::Mat output_frame = TacticalPipeline::create_overlay(
-                    frame, tactical_frames[pass2_idx], OVERLAY_WIDTH, OVERLAY_HEIGHT);
+                    frame, tactical, OVERLAY_WIDTH, OVERLAY_HEIGHT);
                 writer.write(output_frame);
             }
             pass2_idx++;
@@ -333,7 +340,9 @@ public:
             std::cout << "Pass 2 (Annotation/Overlay) time:  " << annotate_elapsed << "ms" << std::endl;
         }
         if (proc_elapsed > 0) {
-            std::cout << "Average Pass 1 FPS: " << (1000.0f * processed_count / proc_elapsed) << std::endl;
+            std::cout << "Average Pass 1 FPS: "
+                      << (1000.0 * static_cast<double>(processed_count) /
+                          static_cast<double>(proc_elapsed)) << std::endl;
         }
         std::cout << "\nPer-frame timing breakdown across " << processed_count << " frames:" << std::endl;
         if (processed_count > 0) {
@@ -374,7 +383,7 @@ private:
 };
 
 int main(int argc, char** argv) {
-    std::cout << "=== Soccer Radar v2.0 ===" << std::endl;
+    std::cout << "=== Soccer Radar v2.1 ===" << std::endl;
     std::cout << "C++ Soccer Analysis Pipeline (Football-TV2Radar + Soccana Combination)" << std::endl;
     std::cout << "Optimized for constrained devices (Termux/ARM)" << std::endl;
     std::cout << std::endl;

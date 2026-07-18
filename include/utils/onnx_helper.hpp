@@ -65,6 +65,8 @@ inline void configure_session_options(Ort::SessionOptions& session_options, int 
         }
     }
 
+    std::cerr << "[Hardware] XNNPACK/NNAPI unavailable; using ONNX Runtime CPU provider."
+              << std::endl;
     if (handle != RTLD_DEFAULT && handle) dlclose(handle);
 }
 

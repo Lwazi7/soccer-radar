@@ -55,6 +55,7 @@ private:
     cv::Mat homography_matrix_;
     cv::Mat inv_homography_matrix_;
     bool valid_{false};
+    int stale_frames_{0};
 };
 
 } // namespace soccer_radar

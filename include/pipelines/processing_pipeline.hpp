@@ -15,7 +15,7 @@ public:
     ProcessingPipeline() = default;
     ~ProcessingPipeline() = default;
 
-    // Interpolate missing ball detections using linear interpolation
+    // Interpolate missing ball detections with a constant-acceleration motion model
     // tracks: frame_index -> ball BBox
     void interpolate_ball_tracks(
         std::unordered_map<int, BBox>& ball_tracks,

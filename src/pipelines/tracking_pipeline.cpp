@@ -115,6 +115,7 @@ void TrackingPipeline::process_frame(const cv::Mat& frame,
     if (timing) {
         *timing = TrackingTiming{};
     }
+    frame_reid_features_.clear();
 
     if (frame_idx_global_ % DETECTION_STRIDE == 0) {
         DetectionTiming dt;
@@ -142,9 +143,39 @@ void TrackingPipeline::process_frame(const cv::Mat& frame,
         last_balls_ = balls;
         last_referees_ = referees;
 
+        // MobileNet descriptors are shared by tracking and team classification. Running
+        // them on detector frames enables appearance-assisted lost-track recovery.
+        const Detections raw_players = players;
+        std::vector<std::vector<float>> reid_features;
+        if (!raw_players.empty()) {
+            auto reid_crops = EmbeddingExtractor::get_player_crops(frame, raw_players.boxes);
+            reid_features = clustering_.get_extractor().extract_batch(reid_crops);
+        }
+
         auto t_track0 = std::chrono::steady_clock::now();
-        players = tracker_.update(players, false);
+        players = tracker_.update(raw_players, false, reid_features);
         auto t_track1 = std::chrono::steady_clock::now();
+
+        // Recover the descriptor used for each matched output so team prediction can
+        // reuse the same MobileNet inference instead of running a second batch.
+        for (const auto& tracked : players.boxes) {
+            float best = -1.0f;
+            int best_idx = -1;
+            for (int i = 0; i < raw_players.size(); ++i) {
+                const auto& candidate = raw_players.boxes[i];
+                const float ix1 = std::max(tracked.x1, candidate.x1);
+                const float iy1 = std::max(tracked.y1, candidate.y1);
+                const float ix2 = std::min(tracked.x2, candidate.x2);
+                const float iy2 = std::min(tracked.y2, candidate.y2);
+                const float inter = std::max(0.0f, ix2 - ix1) * std::max(0.0f, iy2 - iy1);
+                const float uni = tracked.area() + candidate.area() - inter;
+                const float iou = uni > 0.0f ? inter / uni : 0.0f;
+                if (iou > best) { best = iou; best_idx = i; }
+            }
+            if (best_idx >= 0 && best_idx < static_cast<int>(reid_features.size())) {
+                frame_reid_features_[tracked.track_id] = reid_features[best_idx];
+            }
+        }
         if (timing) {
             timing->tracker_update_ms = std::chrono::duration<double, std::milli>(t_track1 - t_track0).count();
         }
@@ -191,10 +222,19 @@ void TrackingPipeline::process_frame(const cv::Mat& frame,
                 new_boxes.push_back(players.boxes[idx]);
             }
 
-            auto crops = EmbeddingExtractor::get_player_crops(frame, new_boxes);
+            std::vector<std::vector<float>> embeddings;
+            bool all_cached = true;
+            for (int idx : needs_embedding) {
+                auto it = frame_reid_features_.find(players.boxes[idx].track_id);
+                if (it == frame_reid_features_.end()) { all_cached = false; break; }
+                embeddings.push_back(it->second);
+            }
+            if (!all_cached) {
+                auto crops = EmbeddingExtractor::get_player_crops(frame, new_boxes);
+                embeddings = clustering_.get_extractor().extract_batch(crops);
+            }
 
-            if (!crops.empty()) {
-                auto embeddings = clustering_.get_extractor().extract_batch(crops);
+            if (!embeddings.empty()) {
                 auto team_labels = clustering_.predict(embeddings);
 
                 for (size_t j = 0; j < needs_embedding.size() && j < team_labels.size(); ++j) {
@@ -202,9 +242,9 @@ void TrackingPipeline::process_frame(const cv::Mat& frame,
                     int tid = players.boxes[player_idx].track_id;
                     int team = team_labels[j];
 
-                    tracker_.update_team_votes(tid, team);
-                    team_cache_[tid] = team;
-                    players.boxes[player_idx].class_id = team;
+                    const int stable_team = tracker_.update_team_votes(tid, team);
+                    team_cache_[tid] = stable_team;
+                    players.boxes[player_idx].class_id = stable_team;
                     last_validation_frame_[tid] = frame_idx_global_;
                 }
 

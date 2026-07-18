@@ -24,27 +24,48 @@ void ProcessingPipeline::interpolate_ball_tracks(
 
     if (valid_positions.size() < 2) return;
 
-    // Linear interpolation between valid positions
-    for (size_t i = 0; i < valid_positions.size() - 1; ++i) {
-        int frame1 = valid_positions[i].first;
-        int frame2 = valid_positions[i + 1].first;
-        const BBox& bbox1 = valid_positions[i].second;
-        const BBox& bbox2 = valid_positions[i + 1].second;
+    // Constant-acceleration interpolation. Initial velocity is estimated from the
+    // preceding observation; acceleration is then solved so the trajectory reaches
+    // the next detection exactly. Box size is interpolated independently.
+    for (size_t i = 0; i + 1 < valid_positions.size(); ++i) {
+        const int frame1 = valid_positions[i].first;
+        const int frame2 = valid_positions[i + 1].first;
+        const BBox& b0 = valid_positions[i].second;
+        const BBox& b1 = valid_positions[i + 1].second;
+        const int gap = frame2 - frame1;
+        if (gap <= 1 || gap > BALL_INTERPOLATION_LIMIT) continue;
 
-        int gap = frame2 - frame1;
-        if (gap > BALL_INTERPOLATION_LIMIT) continue;
+        const float gap_f = static_cast<float>(gap);
+        float vx = (b1.cx() - b0.cx()) / gap_f;
+        float vy = (b1.cy() - b0.cy()) / gap_f;
+        if (i > 0) {
+            const int previous_gap = frame1 - valid_positions[i - 1].first;
+            if (previous_gap > 0 && previous_gap <= BALL_INTERPOLATION_LIMIT) {
+                const BBox& previous = valid_positions[i - 1].second;
+                const float previous_gap_f = static_cast<float>(previous_gap);
+                vx = (b0.cx() - previous.cx()) / previous_gap_f;
+                vy = (b0.cy() - previous.cy()) / previous_gap_f;
+            }
+        }
+        const float gap_sq = gap_f * gap_f;
+        const float ax = 2.0f * (b1.cx() - b0.cx() - vx * gap_f) / gap_sq;
+        const float ay = 2.0f * (b1.cy() - b0.cy() - vy * gap_f) / gap_sq;
 
         for (int f = frame1 + 1; f < frame2; ++f) {
-            float t = static_cast<float>(f - frame1) / static_cast<float>(gap);
+            const float dt = static_cast<float>(f - frame1);
+            const float t = dt / static_cast<float>(gap);
+            const float cx = b0.cx() + vx * dt + 0.5f * ax * dt * dt;
+            const float cy = b0.cy() + vy * dt + 0.5f * ay * dt * dt;
+            const float w = b0.width() + t * (b1.width() - b0.width());
+            const float h = b0.height() + t * (b1.height() - b0.height());
 
             BBox interp;
-            interp.x1 = bbox1.x1 + t * (bbox2.x1 - bbox1.x1);
-            interp.y1 = bbox1.y1 + t * (bbox2.y1 - bbox1.y1);
-            interp.x2 = bbox1.x2 + t * (bbox2.x2 - bbox1.x2);
-            interp.y2 = bbox1.y2 + t * (bbox2.y2 - bbox1.y2);
-            interp.confidence = 0.5f;
-            interp.class_id = 1;
-
+            interp.x1 = std::clamp(cx - 0.5f * w, 0.0f, static_cast<float>(INPUT_WIDTH));
+            interp.y1 = std::clamp(cy - 0.5f * h, 0.0f, static_cast<float>(INPUT_HEIGHT));
+            interp.x2 = std::clamp(cx + 0.5f * w, 0.0f, static_cast<float>(INPUT_WIDTH));
+            interp.y2 = std::clamp(cy + 0.5f * h, 0.0f, static_cast<float>(INPUT_HEIGHT));
+            interp.confidence = 0.35f;
+            interp.class_id = static_cast<int>(ObjectClass::Ball);
             ball_tracks[f] = interp;
         }
     }

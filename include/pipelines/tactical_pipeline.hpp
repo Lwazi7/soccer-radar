@@ -15,11 +15,13 @@ public:
 
     // Process detections and keypoints for tactical analysis
     // Returns tactical frame (pitch view) and metadata
-    cv::Mat process_frame(const Detections& players,
+    cv::Mat process_frame(const cv::Mat& frame,
+                          const Detections& players,
                           const Detections& balls,
                           const Detections& referees,
                           const KeypointData& keypoints,
-                          TacticalMetadata& metadata);
+                          TacticalMetadata& metadata,
+                          bool render = true);
 
     // Create overlay: tactical view on top of original frame
     static cv::Mat create_overlay(const cv::Mat& original,
@@ -29,6 +31,9 @@ public:
 
 private:
     HomographyTransformer homography_;
+    cv::Mat previous_gray_;
+    KeypointData tracked_keypoints_;
+    KeypointData last_detector_keypoints_;
 };
 
 } // namespace soccer_radar

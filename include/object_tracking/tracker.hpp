@@ -13,9 +13,11 @@ public:
                 int buffer_size = TRACKER_BUFFER_SIZE);
     ~ByteTracker() = default;
 
-    Detections update(const Detections& detections, bool is_predicted_frame = false);
+    Detections update(const Detections& detections,
+                      bool is_predicted_frame = false,
+                      const std::vector<std::vector<float>>& detection_features = {});
     void update_team_labels(const std::unordered_map<int, int>& team_cache);
-    void update_team_votes(int track_id, int predicted_team);
+    int update_team_votes(int track_id, int predicted_team);
     void reset();
 
 private:
@@ -24,11 +26,14 @@ private:
     void kalman_init(TrackState& track, const BBox& bbox);
 
     static float compute_iou(const BBox& a, const BBox& b);
+    static float cosine_distance(const std::vector<float>& a, const std::vector<float>& b);
+    static void update_appearance(TrackState& track, const std::vector<float>& feature);
 
-    // Hungarian Algorithm (optimal bipartite assignment) across IoU cost matrices
+    // Hungarian assignment with motion/IoU gating and appearance recovery.
     std::vector<std::pair<int,int>> match_tracks_to_detections(
         const std::vector<TrackState>& tracks,
         const std::vector<BBox>& detections,
+        const std::vector<std::vector<float>>& detection_features,
         float thresh);
 
     static std::vector<std::pair<int,int>> solve_hungarian(

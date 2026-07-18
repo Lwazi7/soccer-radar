@@ -4,9 +4,12 @@
 #include <cmath>
 #include <random>
 #include <algorithm>
+#include <numeric>
 #include <iostream>
 #include <limits>
 #include <map>
+#include <unordered_set>
+#include <sstream>
 
 namespace soccer_radar {
 
@@ -47,36 +50,41 @@ std::vector<std::vector<FieldCorner>> HomographyTransformer::choose_subsets(
     const std::vector<FieldCorner>& corners, int num_subsets) {
 
     std::vector<std::vector<FieldCorner>> subsets;
-    if (corners.size() < 4) return subsets;
+    if (corners.size() < 4 || num_subsets <= 0) return subsets;
 
-    if (corners.size() == 4) {
-        if (!are_collinear(corners[0], corners[1], corners[2]) &&
-            !are_collinear(corners[0], corners[1], corners[3]) &&
-            !are_collinear(corners[1], corners[2], corners[3])) {
-            subsets.push_back(corners);
-        }
-        return subsets;
-    }
-
+    // PROSAC-style progressive sampling: confidence-ranked observations enter the
+    // sampling pool gradually. This prioritizes reliable keypoints while retaining
+    // enough diversity to resolve pitch symmetry.
+    std::vector<FieldCorner> ranked = corners;
+    std::stable_sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+        return a.confidence > b.confidence;
+    });
     std::mt19937 rng(42);
-    int attempt = 0;
-    while (static_cast<int>(subsets.size()) < num_subsets && attempt < 2000) {
-        attempt++;
-        std::vector<int> indices(corners.size());
-        for (size_t i = 0; i < corners.size(); ++i) indices[i] = static_cast<int>(i);
-        std::shuffle(indices.begin(), indices.end(), rng);
+    std::unordered_set<std::string> seen;
+    const int max_attempts = std::max(64, num_subsets * 12);
 
-        std::vector<FieldCorner> sel = { corners[indices[0]], corners[indices[1]], corners[indices[2]], corners[indices[3]] };
+    for (int attempt = 0; attempt < max_attempts &&
+                          static_cast<int>(subsets.size()) < num_subsets; ++attempt) {
+        const size_t pool_size = std::min(ranked.size(),
+            static_cast<size_t>(4 + attempt / std::max(1, num_subsets / 2)));
+        std::vector<int> ids(pool_size);
+        std::iota(ids.begin(), ids.end(), 0);
+        std::shuffle(ids.begin(), ids.end(), rng);
+        ids.resize(4);
+        std::sort(ids.begin(), ids.end());
 
-        bool collinear = false;
-        if (are_collinear(sel[0], sel[1], sel[2]) || are_collinear(sel[0], sel[1], sel[3]) ||
-            are_collinear(sel[0], sel[2], sel[3]) || are_collinear(sel[1], sel[2], sel[3])) {
-            collinear = true;
-        }
+        std::ostringstream key;
+        for (int id : ids) key << id << ',';
+        if (!seen.insert(key.str()).second) continue;
 
-        if (!collinear) {
-            subsets.push_back(std::move(sel));
-        }
+        std::vector<FieldCorner> candidate;
+        for (int id : ids) candidate.push_back(ranked[id]);
+        const bool degenerate =
+            are_collinear(candidate[0], candidate[1], candidate[2]) ||
+            are_collinear(candidate[0], candidate[1], candidate[3]) ||
+            are_collinear(candidate[0], candidate[2], candidate[3]) ||
+            are_collinear(candidate[1], candidate[2], candidate[3]);
+        if (!degenerate) subsets.push_back(std::move(candidate));
     }
     return subsets;
 }
@@ -187,7 +195,15 @@ double HomographyTransformer::solve_subset(const std::vector<FieldCorner>& subse
 
 bool HomographyTransformer::compute(const KeypointData& keypoints) {
     valid_ = false;
-    if (keypoints.num_corners() < MIN_CORNERS_FOR_HOMOGRAPHY) return false;
+    const auto reuse_recent = [&]() {
+        if (!homography_matrix_.empty() && stale_frames_ < 10) {
+            ++stale_frames_;
+            valid_ = true;
+            return true;
+        }
+        return false;
+    };
+    if (keypoints.num_corners() < MIN_CORNERS_FOR_HOMOGRAPHY) return reuse_recent();
 
     std::vector<FieldCorner> valid_corners;
     for (const auto& c : keypoints.corners) {
@@ -195,10 +211,10 @@ bool HomographyTransformer::compute(const KeypointData& keypoints) {
             valid_corners.push_back(c);
         }
     }
-    if (valid_corners.size() < static_cast<size_t>(MIN_CORNERS_FOR_HOMOGRAPHY)) return false;
+    if (valid_corners.size() < static_cast<size_t>(MIN_CORNERS_FOR_HOMOGRAPHY)) return reuse_recent();
 
-    auto subsets = choose_subsets(valid_corners, 5);
-    if (subsets.empty()) return false;
+    auto subsets = choose_subsets(valid_corners, 32);
+    if (subsets.empty()) return reuse_recent();
 
     double global_max_score = -1e18;
     cv::Mat best_global_H;
@@ -212,10 +228,28 @@ bool HomographyTransformer::compute(const KeypointData& keypoints) {
         }
     }
 
-    if (best_global_H.empty() || global_max_score <= -1e17) return false;
+    if (best_global_H.empty() || global_max_score <= -1e17) return reuse_recent();
 
-    homography_matrix_ = best_global_H.clone();
-    inv_homography_matrix_ = homography_matrix_.inv();
+    best_global_H.convertTo(best_global_H, CV_64F);
+    best_global_H /= best_global_H.at<double>(2, 2);
+
+    // Reject implausible one-frame jumps and smooth accepted motion. The optical-flow
+    // keypoint propagation in TacticalPipeline supplies dense temporal updates.
+    if (!homography_matrix_.empty()) {
+        cv::Mat previous = homography_matrix_ / homography_matrix_.at<double>(2, 2);
+        const double jump = cv::norm(best_global_H - previous, cv::NORM_L2);
+        const double alpha = jump > 25.0 ? 0.20 : 0.35;
+        homography_matrix_ = (1.0 - alpha) * previous + alpha * best_global_H;
+        homography_matrix_ /= homography_matrix_.at<double>(2, 2);
+    } else {
+        homography_matrix_ = best_global_H.clone();
+    }
+    if (!cv::invert(homography_matrix_, inv_homography_matrix_, cv::DECOMP_SVD) ||
+        !cv::checkRange(homography_matrix_) || !cv::checkRange(inv_homography_matrix_)) {
+        valid_ = false;
+        return reuse_recent();
+    }
+    stale_frames_ = 0;
     valid_ = true;
     return true;
 }

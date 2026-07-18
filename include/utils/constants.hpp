@@ -62,6 +62,9 @@ constexpr float TRACKER_MATCH_THRESH     = 0.35f;
 constexpr float TRACKER_HIGH_CONF_THRESH = 0.25f; // Stage 1 high-confidence pool (D_high)
 constexpr float TRACKER_LOW_CONF_THRESH  = 0.10f; // Stage 2 occlusion recovery pool (D_low)
 constexpr int   TRACKER_BUFFER_SIZE      = 120;   // 120 frames (4 seconds) lost track retention
+constexpr int   TRACKER_MAX_DETECTIONS   = 40;    // Bound assignment cost on noisy crowd shots
+constexpr float REID_COSINE_THRESHOLD    = 0.35f; // Maximum cosine distance for appearance recovery
+constexpr float REID_EMA_ALPHA           = 0.90f; // Track feature history smoothing
 constexpr int   MAX_TRACK_ID             = 100000;
 
 // Configurable detection stride (1 = run every frame, 2 = 50% compute reduction via Kalman prediction)
@@ -75,7 +78,10 @@ constexpr int   EMBEDDING_BATCH_SIZE = 24;   // Batched crop processing parity
 constexpr int   PCA_COMPONENTS       = 3;
 constexpr int   NUM_TEAMS            = 2;
 constexpr int   KMEANS_MAX_ITER      = 50;
+constexpr int   KMEANS_RESTARTS      = 3;
 constexpr float KMEANS_EPS           = 1e-4f;
+constexpr float MIN_CLUSTER_SILHOUETTE = 0.15f; // Reject visually inseparable team clusters
+constexpr int   TEAM_VOTE_WINDOW       = 15;    // Per-track temporal label window
 
 // ============================================================================
 // Training Parameters
@@ -86,7 +92,7 @@ constexpr int TRAINING_FRAME_LIMIT  = 120 * 24; // ~2 minutes at 24fps
 // ============================================================================
 // Ball Interpolation (Exact Soccer_Analysis Parity)
 // ============================================================================
-constexpr int BALL_INTERPOLATION_LIMIT = 30; // Max gap in frames for linear interpolation
+constexpr int BALL_INTERPOLATION_LIMIT = 30; // Max gap for constant-acceleration interpolation
 
 // ============================================================================
 // Class Colors (BGR)

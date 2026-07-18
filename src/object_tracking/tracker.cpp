@@ -4,6 +4,7 @@
 #include <tuple>
 #include <limits>
 #include <numeric>
+#include <opencv2/core.hpp>
 
 namespace soccer_radar {
 
@@ -38,91 +39,89 @@ void ByteTracker::kalman_init(TrackState& track, const BBox& bbox) {
 
 void ByteTracker::kalman_predict(TrackState& track) {
     auto& s = track.state;
-    s[0] += s[4];
-    s[1] += s[5];
-    s[2] += s[6];
-    s[3] += s[7];
+    s[0] += s[4]; s[1] += s[5]; s[2] += s[6]; s[3] += s[7];
+    s[2] = std::max(s[2], 1.0f);
+    s[3] = std::max(s[3], 1.0f);
 
-    // Process noise covariance addition
+    cv::Matx<float, 8, 8> F = cv::Matx<float, 8, 8>::eye();
+    for (int i = 0; i < 4; ++i) F(i, i + 4) = 1.0f;
+    cv::Matx<float, 8, 8> P;
+    for (int r = 0; r < 8; ++r)
+        for (int c = 0; c < 8; ++c)
+            P(r, c) = track.covariance[r * 8 + c];
+
+    cv::Matx<float, 8, 8> Q = cv::Matx<float, 8, 8>::zeros();
     for (int i = 0; i < 4; ++i) {
-        track.covariance[i * 8 + i] += 1.0f;
-        track.covariance[(i + 4) * 8 + (i + 4)] += 0.25f;
+        Q(i, i) = 1.0f;
+        Q(i + 4, i + 4) = 0.25f;
     }
+    const auto predicted = F * P * F.t() + Q;
+    for (int r = 0; r < 8; ++r)
+        for (int c = 0; c < 8; ++c)
+            track.covariance[r * 8 + c] = predicted(r, c);
 }
 
 void ByteTracker::kalman_update(TrackState& track, const BBox& measurement) {
-    float z[4] = { measurement.cx(), measurement.cy(), measurement.width(), measurement.height() };
-    
-    // Adaptive observation noise R based on detection confidence
-    float conf = std::max(0.05f, std::min(1.0f, measurement.confidence));
-    float r_pos = (1.0f - conf) * 10.0f + 1.0f;
-    float r_size = (1.0f - conf) * 50.0f + 5.0f;
-    float R[4] = { r_pos, r_pos, r_size, r_size };
+    const cv::Vec4f z(measurement.cx(), measurement.cy(),
+                      measurement.width(), measurement.height());
 
-    // Innovation covariance S = H P H^T + R (4x4 diagonal/sub-block of 8x8 covariance)
-    // Since H extracts the top 4 states [cx, cy, w, h]:
-    float S[4][4];
-    for (int i = 0; i < 4; ++i) {
-        for (int j = 0; j < 4; ++j) {
-            S[i][j] = track.covariance[i * 8 + j];
-            if (i == j) S[i][j] += R[i];
+    const float conf = std::clamp(measurement.confidence, 0.05f, 1.0f);
+    const cv::Matx44f R = cv::Matx44f::diag(cv::Vec4f(
+        (1.0f - conf) * 10.0f + 1.0f,
+        (1.0f - conf) * 10.0f + 1.0f,
+        (1.0f - conf) * 50.0f + 5.0f,
+        (1.0f - conf) * 50.0f + 5.0f));
+
+    cv::Matx<float, 8, 8> P;
+    for (int r = 0; r < 8; ++r)
+        for (int c = 0; c < 8; ++c)
+            P(r, c) = track.covariance[r * 8 + c];
+
+    cv::Matx44f S;
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c)
+            S(r, c) = P(r, c) + R(r, c);
+
+    cv::Matx44f S_inv;
+    bool inverted = cv::invert(S, S_inv, cv::DECOMP_CHOLESKY);
+    if (!inverted) {
+        // Retry with diagonal jitter rather than silently applying a corrupt gain.
+        for (int i = 0; i < 4; ++i) S(i, i) += 1e-3f;
+        inverted = cv::invert(S, S_inv, cv::DECOMP_SVD);
+    }
+    if (!inverted || !cv::checkRange(cv::Mat(S_inv))) return;
+
+    cv::Matx<float, 8, 4> PHt;
+    for (int r = 0; r < 8; ++r)
+        for (int c = 0; c < 4; ++c)
+            PHt(r, c) = P(r, c);
+    const cv::Matx<float, 8, 4> K = PHt * S_inv;
+
+    const cv::Vec4f innovation = z - cv::Vec4f(
+        track.state[0], track.state[1], track.state[2], track.state[3]);
+    const cv::Vec<float, 8> correction = K * innovation;
+    for (int i = 0; i < 8; ++i) track.state[i] += correction[i];
+
+    // Joseph stabilized covariance update preserves symmetry/positive semi-definiteness.
+    cv::Matx<float, 8, 8> I = cv::Matx<float, 8, 8>::eye();
+    cv::Matx<float, 8, 8> KH = cv::Matx<float, 8, 8>::zeros();
+    for (int r = 0; r < 8; ++r)
+        for (int c = 0; c < 4; ++c)
+            KH(r, c) = K(r, c);
+    const auto A = I - KH;
+    cv::Matx<float, 8, 8> KRKt = cv::Matx<float, 8, 8>::zeros();
+    for (int r = 0; r < 8; ++r)
+        for (int c = 0; c < 8; ++c)
+            for (int k = 0; k < 4; ++k)
+                KRKt(r, c) += K(r, k) * R(k, k) * K(c, k);
+    cv::Matx<float, 8, 8> P_new = A * P * A.t() + KRKt;
+    for (int r = 0; r < 8; ++r) {
+        for (int c = 0; c < 8; ++c) {
+            const float sym = 0.5f * (P_new(r, c) + P_new(c, r));
+            track.covariance[r * 8 + c] = sym;
         }
+        track.covariance[r * 8 + r] = std::max(track.covariance[r * 8 + r], 1e-6f);
     }
-
-    // Invert 4x4 symmetric matrix S using Cholesky / exact LU decomposition
-    float S_inv[4][4] = {{0}};
-    float det = S[0][0] * (S[1][1] * (S[2][2] * S[3][3] - S[2][3] * S[3][2]) - S[1][2] * (S[2][1] * S[3][3] - S[2][3] * S[3][1]) + S[1][3] * (S[2][1] * S[3][2] - S[2][2] * S[3][1]))
-              - S[0][1] * (S[1][0] * (S[2][2] * S[3][3] - S[2][3] * S[3][2]) - S[1][2] * (S[2][0] * S[3][3] - S[2][3] * S[3][0]) + S[1][3] * (S[2][0] * S[3][2] - S[2][2] * S[3][0]))
-              + S[0][2] * (S[1][0] * (S[2][1] * S[3][3] - S[2][3] * S[3][1]) - S[1][1] * (S[2][0] * S[3][3] - S[2][3] * S[3][0]) + S[1][3] * (S[2][0] * S[3][1] - S[2][1] * S[3][0]))
-              - S[0][3] * (S[1][0] * (S[2][1] * S[3][2] - S[2][2] * S[3][1]) - S[1][1] * (S[2][0] * S[3][2] - S[2][2] * S[3][0]) + S[1][2] * (S[2][0] * S[3][1] - S[2][1] * S[3][0]));
-
-    if (std::abs(det) > 1e-6f) {
-        // Fast exact inverse for diagonal-dominant S
-        for (int i = 0; i < 4; ++i) {
-            S_inv[i][i] = 1.0f / std::max(1e-4f, S[i][i]);
-        }
-    } else {
-        for (int i = 0; i < 4; ++i) S_inv[i][i] = 1.0f / (R[i] + 1.0f);
-    }
-
-    // Kalman Gain K = (P H^T) S^{-1} (8x4 matrix)
-    float K[8][4] = {{0}};
-    for (int i = 0; i < 8; ++i) {
-        for (int j = 0; j < 4; ++j) {
-            float sum = 0.0f;
-            for (int m = 0; m < 4; ++m) {
-                sum += track.covariance[i * 8 + m] * S_inv[m][j];
-            }
-            K[i][j] = sum;
-        }
-    }
-
-    // State update: x_new = x_old + K (z - H x_old)
-    float innovation[4] = {
-        z[0] - track.state[0],
-        z[1] - track.state[1],
-        z[2] - track.state[2],
-        z[3] - track.state[3]
-    };
-
-    for (int i = 0; i < 8; ++i) {
-        float step = 0.0f;
-        for (int j = 0; j < 4; ++j) step += K[i][j] * innovation[j];
-        track.state[i] += step;
-    }
-
-    // Covariance update: P_new = (I - K H) P_old
-    std::array<float, 64> new_cov{};
-    for (int i = 0; i < 8; ++i) {
-        for (int j = 0; j < 8; ++j) {
-            float kh_p = 0.0f;
-            for (int m = 0; m < 4; ++m) {
-                kh_p += K[i][m] * track.covariance[m * 8 + j];
-            }
-            new_cov[i * 8 + j] = track.covariance[i * 8 + j] - kh_p;
-        }
-    }
-    track.covariance = new_cov;
 }
 
 float ByteTracker::compute_iou(const BBox& a, const BBox& b) {
@@ -136,120 +135,120 @@ float ByteTracker::compute_iou(const BBox& a, const BBox& b) {
     return (uni > 0.0f) ? inter / uni : 0.0f;
 }
 
+float ByteTracker::cosine_distance(const std::vector<float>& a,
+                                   const std::vector<float>& b) {
+    if (a.empty() || a.size() != b.size()) return 1.0f;
+    float dot = 0.0f, na = 0.0f, nb = 0.0f;
+    for (size_t i = 0; i < a.size(); ++i) {
+        dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i];
+    }
+    if (na <= 1e-12f || nb <= 1e-12f) return 1.0f;
+    return 1.0f - std::clamp(dot / std::sqrt(na * nb), -1.0f, 1.0f);
+}
+
+void ByteTracker::update_appearance(TrackState& track,
+                                    const std::vector<float>& feature) {
+    if (feature.empty()) return;
+    if (track.appearance.size() != feature.size()) {
+        track.appearance = feature;
+    } else {
+        for (size_t i = 0; i < feature.size(); ++i) {
+            track.appearance[i] = REID_EMA_ALPHA * track.appearance[i] +
+                                  (1.0f - REID_EMA_ALPHA) * feature[i];
+        }
+    }
+    float norm = 0.0f;
+    for (float v : track.appearance) norm += v * v;
+    norm = std::sqrt(norm);
+    if (norm > 1e-6f) for (float& v : track.appearance) v /= norm;
+}
+
 std::vector<std::pair<int, int>> ByteTracker::solve_hungarian(
     const std::vector<std::vector<float>>& cost_matrix,
     float max_cost) {
 
-    std::vector<std::pair<int, int>> matches;
-    if (cost_matrix.empty() || cost_matrix[0].empty()) return matches;
+    if (cost_matrix.empty() || cost_matrix.front().empty()) return {};
+    const int rows = static_cast<int>(cost_matrix.size());
+    const int cols = static_cast<int>(cost_matrix.front().size());
+    const int n = std::max(rows, cols);
+    constexpr double forbidden = 1e6;
 
-    int rows = static_cast<int>(cost_matrix.size());
-    int cols = static_cast<int>(cost_matrix[0].size());
-
-    // Native C++ optimal assignment across bipartite cost matrix using shortest augmenting paths
-    std::vector<int> row_assign(rows, -1);
-    std::vector<int> col_assign(cols, -1);
-    std::vector<float> u(rows, 0.0f);
-    std::vector<float> v(cols, 0.0f);
-
-    for (int i = 0; i < rows; ++i) {
-        float min_val = std::numeric_limits<float>::max();
-        for (int j = 0; j < cols; ++j) min_val = std::min(min_val, cost_matrix[i][j]);
-        u[i] = min_val;
-    }
-
-    for (int cur_row = 0; cur_row < rows; ++cur_row) {
-        std::vector<float> minv(cols, std::numeric_limits<float>::max());
-        std::vector<bool> visited(cols, false);
-        std::vector<int> col_prev(cols, -1);
-        int cur_col = -1;
-
-        // Find augmenting path
-        for (int j = 0; j < cols; ++j) {
-            float reduced_cost = cost_matrix[cur_row][j] - u[cur_row] - v[j];
-            if (reduced_cost < minv[j]) {
-                minv[j] = reduced_cost;
-                col_prev[j] = cur_row;
+    // Standard shortest-augmenting-path Hungarian implementation. Padding makes the
+    // rectangular case explicit and avoids dropping rows when tracks > detections.
+    std::vector<double> u(n + 1), v(n + 1);
+    std::vector<int> p(n + 1), way(n + 1);
+    for (int i = 1; i <= n; ++i) {
+        p[0] = i;
+        int j0 = 0;
+        std::vector<double> minv(n + 1, forbidden);
+        std::vector<unsigned char> used(n + 1, false);
+        do {
+            used[j0] = true;
+            const int i0 = p[j0];
+            double delta = forbidden;
+            int j1 = 0;
+            for (int j = 1; j <= n; ++j) if (!used[j]) {
+                double c = max_cost + 1.0; // dummy assignment
+                if (i0 <= rows && j <= cols) c = cost_matrix[i0 - 1][j - 1];
+                const double cur = c - u[i0] - v[j];
+                if (cur < minv[j]) { minv[j] = cur; way[j] = j0; }
+                if (minv[j] < delta) { delta = minv[j]; j1 = j; }
             }
-        }
-
-        while (true) {
-            float delta = std::numeric_limits<float>::max();
-            int next_col = -1;
-            for (int j = 0; j < cols; ++j) {
-                if (!visited[j] && minv[j] < delta) {
-                    delta = minv[j];
-                    next_col = j;
-                }
-            }
-            if (next_col == -1 || delta >= 1e5f) break;
-
-            u[cur_row] += delta;
-            for (int j = 0; j < cols; ++j) {
-                if (visited[j]) v[j] -= delta;
+            for (int j = 0; j <= n; ++j) {
+                if (used[j]) { u[p[j]] += delta; v[j] -= delta; }
                 else minv[j] -= delta;
             }
-            cur_col = next_col;
-            visited[cur_col] = true;
-
-            if (col_assign[cur_col] == -1) break;
-            int prev_assigned_row = col_assign[cur_col];
-            for (int j = 0; j < cols; ++j) {
-                if (!visited[j]) {
-                    float rc = cost_matrix[prev_assigned_row][j] - u[prev_assigned_row] - v[j];
-                    if (rc < minv[j]) {
-                        minv[j] = rc;
-                        col_prev[j] = prev_assigned_row;
-                    }
-                }
-            }
-        }
-
-        if (cur_col != -1 && cost_matrix[col_prev[cur_col]][cur_col] <= max_cost) {
-            int c = cur_col;
-            while (c != -1) {
-                int r = col_prev[c];
-                int old_c = row_assign[r];
-                col_assign[c] = r;
-                row_assign[r] = c;
-                c = old_c;
-            }
-        }
+            j0 = j1;
+        } while (p[j0] != 0);
+        do {
+            const int j1 = way[j0];
+            p[j0] = p[j1];
+            j0 = j1;
+        } while (j0 != 0);
     }
 
-    for (int i = 0; i < rows; ++i) {
-        if (row_assign[i] != -1 && cost_matrix[i][row_assign[i]] <= max_cost) {
-            matches.emplace_back(i, row_assign[i]);
+    std::vector<std::pair<int, int>> matches;
+    for (int j = 1; j <= n; ++j) {
+        const int i = p[j];
+        if (i >= 1 && i <= rows && j <= cols &&
+            cost_matrix[i - 1][j - 1] <= max_cost) {
+            matches.emplace_back(i - 1, j - 1);
         }
     }
-
     return matches;
 }
 
 std::vector<std::pair<int, int>> ByteTracker::match_tracks_to_detections(
     const std::vector<TrackState>& tracks,
     const std::vector<BBox>& detections,
+    const std::vector<std::vector<float>>& detection_features,
     float thresh) {
 
-    std::vector<std::pair<int, int>> matches;
-    if (tracks.empty() || detections.empty()) return matches;
+    if (tracks.empty() || detections.empty()) return {};
+    const int n_tracks = static_cast<int>(tracks.size());
+    const int n_dets = static_cast<int>(detections.size());
+    std::vector<std::vector<float>> cost(n_tracks, std::vector<float>(n_dets, 1e6f));
 
-    int n_tracks = static_cast<int>(tracks.size());
-    int n_dets = static_cast<int>(detections.size());
-
-    // Build IoU cost matrix (cost = 1.0f - IoU)
-    std::vector<std::vector<float>> cost_matrix(n_tracks, std::vector<float>(n_dets, 1e6f));
     for (int i = 0; i < n_tracks; ++i) {
         for (int j = 0; j < n_dets; ++j) {
-            float iou = compute_iou(tracks[i].bbox, detections[j]);
+            const float iou = compute_iou(tracks[i].bbox, detections[j]);
+            const bool has_feature = j < static_cast<int>(detection_features.size()) &&
+                                     !detection_features[j].empty() && !tracks[i].appearance.empty();
+            const float app = has_feature
+                ? cosine_distance(tracks[i].appearance, detection_features[j]) : 1.0f;
+
+            // Spatial overlap handles normal motion; appearance may recover a lost player
+            // after an occlusion, but is gated tightly to avoid same-kit identity swaps.
             if (iou > thresh) {
-                cost_matrix[i][j] = 1.0f - iou;
+                cost[i][j] = has_feature ? 0.75f * (1.0f - iou) + 0.25f * app
+                                         : 1.0f - iou;
+            } else if (tracks[i].frames_since_seen > 0 && has_feature &&
+                       app <= REID_COSINE_THRESHOLD) {
+                cost[i][j] = 0.45f + 0.45f * app + 0.10f * (1.0f - iou);
             }
         }
     }
-
-    float max_cost = 1.0f - thresh;
-    return solve_hungarian(cost_matrix, max_cost);
+    return solve_hungarian(cost, 0.75f);
 }
 
 void ByteTracker::update_team_labels(const std::unordered_map<int, int>& team_cache) {
@@ -267,22 +266,29 @@ void ByteTracker::update_team_labels(const std::unordered_map<int, int>& team_ca
     }
 }
 
-void ByteTracker::update_team_votes(int track_id, int predicted_team) {
+int ByteTracker::update_team_votes(int track_id, int predicted_team) {
     auto update_fn = [track_id, predicted_team](TrackState& t) {
         if (t.track_id == track_id) {
-            if (predicted_team == 0) t.team0_vote_count++;
-            else if (predicted_team == 1) t.team1_vote_count++;
-            if (t.team0_vote_count >= t.team1_vote_count) t.team_label = 0;
-            else t.team_label = 1;
+            if (predicted_team != 0 && predicted_team != 1) return true;
+            t.team_vote_history.push_back(predicted_team);
+            if (t.team_vote_history.size() > TEAM_VOTE_WINDOW) {
+                t.team_vote_history.erase(t.team_vote_history.begin());
+            }
+            t.team0_vote_count = static_cast<int>(std::count(
+                t.team_vote_history.begin(), t.team_vote_history.end(), 0));
+            t.team1_vote_count = static_cast<int>(t.team_vote_history.size()) - t.team0_vote_count;
+            t.team_label = (t.team0_vote_count >= t.team1_vote_count) ? 0 : 1;
             return true;
         }
         return false;
     };
-    for (auto& t : active_tracks_) if (update_fn(t)) break;
-    for (auto& t : lost_tracks_) if (update_fn(t)) break;
+    for (auto& t : active_tracks_) if (update_fn(t)) return t.team_label;
+    for (auto& t : lost_tracks_) if (update_fn(t)) return t.team_label;
+    return predicted_team;
 }
 
-Detections ByteTracker::update(const Detections& detections, bool is_predicted_frame) {
+Detections ByteTracker::update(const Detections& detections, bool is_predicted_frame,
+                               const std::vector<std::vector<float>>& detection_features) {
     for (auto& track : active_tracks_) {
         kalman_predict(track);
         track.bbox.x1 = track.state[0] - track.state[2] * 0.5f;
@@ -314,12 +320,25 @@ Detections ByteTracker::update(const Detections& detections, bool is_predicted_f
         return pred_result;
     }
 
+    // Keep assignment complexity bounded without allowing arbitrary detector order
+    // to decide which observations survive on noisy crowd frames.
+    std::vector<size_t> order(detections.boxes.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return detections.boxes[a].confidence > detections.boxes[b].confidence;
+    });
+    if (order.size() > TRACKER_MAX_DETECTIONS) order.resize(TRACKER_MAX_DETECTIONS);
+
     std::vector<BBox> det_high, det_low;
-    for (const auto& b : detections.boxes) {
+    std::vector<std::vector<float>> feat_high, feat_low;
+    for (size_t idx : order) {
+        const auto& b = detections.boxes[idx];
+        const std::vector<float> empty;
+        const auto& feature = idx < detection_features.size() ? detection_features[idx] : empty;
         if (b.confidence >= TRACKER_HIGH_CONF_THRESH) {
-            det_high.push_back(b);
+            det_high.push_back(b); feat_high.push_back(feature);
         } else if (b.confidence >= TRACKER_LOW_CONF_THRESH) {
-            det_low.push_back(b);
+            det_low.push_back(b); feat_low.push_back(feature);
         }
     }
 
@@ -327,7 +346,7 @@ Detections ByteTracker::update(const Detections& detections, bool is_predicted_f
     int n_active = static_cast<int>(active_tracks_.size());
     track_pool.insert(track_pool.end(), lost_tracks_.begin(), lost_tracks_.end());
 
-    auto matches_high = match_tracks_to_detections(track_pool, det_high, match_thresh_);
+    auto matches_high = match_tracks_to_detections(track_pool, det_high, feat_high, match_thresh_);
 
     std::vector<bool> pool_matched(track_pool.size(), false);
     std::vector<bool> high_matched(det_high.size(), false);
@@ -340,6 +359,7 @@ Detections ByteTracker::update(const Detections& detections, bool is_predicted_f
         track_pool[track_idx].bbox = det_high[det_idx];
         track_pool[track_idx].frames_since_seen = 0;
         track_pool[track_idx].total_hits++;
+        update_appearance(track_pool[track_idx], feat_high[det_idx]);
 
         if (det_high[det_idx].class_id == 2) track_pool[track_idx].referee_vote_count++;
         else track_pool[track_idx].player_vote_count++;
@@ -365,7 +385,7 @@ Detections ByteTracker::update(const Detections& detections, bool is_predicted_f
         }
     }
 
-    auto matches_low = match_tracks_to_detections(remain_active, det_low, 0.25f);
+    auto matches_low = match_tracks_to_detections(remain_active, det_low, feat_low, 0.25f);
     std::vector<bool> remain_active_matched(remain_active.size(), false);
 
     for (const auto& [track_idx, det_idx] : matches_low) {
@@ -373,6 +393,7 @@ Detections ByteTracker::update(const Detections& detections, bool is_predicted_f
         remain_active[track_idx].bbox = det_low[det_idx];
         remain_active[track_idx].frames_since_seen = 0;
         remain_active[track_idx].total_hits++;
+        update_appearance(remain_active[track_idx], feat_low[det_idx]);
 
         if (det_low[det_idx].class_id == 2) remain_active[track_idx].referee_vote_count++;
         else remain_active[track_idx].player_vote_count++;
@@ -416,6 +437,7 @@ Detections ByteTracker::update(const Detections& detections, bool is_predicted_f
             new_track.frames_since_seen = 0;
             new_track.total_hits = 1;
             kalman_init(new_track, det_high[i]);
+            update_appearance(new_track, feat_high[i]);
             next_active.push_back(new_track);
 
             BBox out = det_high[i];

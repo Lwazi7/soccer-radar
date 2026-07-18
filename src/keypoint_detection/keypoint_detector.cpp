@@ -73,16 +73,14 @@ bool KeypointDetector::load_model(const std::string& model_path) {
     }
 }
 
-void KeypointDetector::preprocess(const cv::Mat& frame, std::vector<float>& blob) {
+void KeypointDetector::preprocess(const cv::Mat& frame) {
     letterbox_frame(frame, letterboxed_,
                     input_width_, input_height_,
                     LETTERBOX_PAD_TOP, LETTERBOX_PAD_BOTTOM,
                     LETTERBOX_PAD_LEFT, LETTERBOX_PAD_RIGHT);
 
     const int hw = input_height_ * input_width_;
-    blob.resize(static_cast<size_t>(3 * hw));
-
-    float* ch_r = blob.data();
+    float* ch_r = input_blob_.data();
     float* ch_g = ch_r + hw;
     float* ch_b = ch_g + hw;
 
@@ -197,7 +195,7 @@ KeypointData KeypointDetector::detect(const cv::Mat& frame) {
     KeypointData result;
     if (!session_) return result;
 
-    preprocess(frame, input_blob_);
+    preprocess(frame);
 
     std::array<int64_t, 4> input_shape = {1, 3, input_height_, input_width_};
     Ort::Value input_tensor{nullptr};

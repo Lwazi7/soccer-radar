@@ -1,6 +1,7 @@
 #include "utils/letterbox.hpp"
 #include "utils/constants.hpp"
 #include <cstring>
+#include <stdexcept>
 
 namespace soccer_radar {
 
@@ -8,9 +9,12 @@ void letterbox_frame(const cv::Mat& src, cv::Mat& dst,
                      int target_w, int target_h,
                      int pad_top, int pad_bottom,
                      int pad_left, int pad_right) {
-    // For our specific case: 1280x720 -> 1280x736
-    // Since width doesn't change, we only pad vertically
-    // This is a zero-copy optimization: we just copy the source into the padded region
+    // For our specific case: 1280x720 -> 1280x736. Fail explicitly rather
+    // than writing outside the destination if an unsupported resolution is supplied.
+    if (src.empty() || src.cols + pad_left + pad_right != target_w ||
+        src.rows + pad_top + pad_bottom != target_h) {
+        throw std::invalid_argument("letterbox_frame: source dimensions and padding do not match model input");
+    }
 
     if (dst.rows != target_h || dst.cols != target_w || dst.type() != src.type()) {
         dst.create(target_h, target_w, src.type());
